@@ -671,6 +671,21 @@ class XClient:
 X_API = XClient()
 
 
+async def ensure_user_client_connected() -> None:
+    """Reconnect the personal Telethon client when Railway drops it."""
+
+    if not user_client.is_connected():
+        LOGGER.warning(
+            "Telethon user client disconnected. Reconnecting..."
+        )
+        await user_client.connect()
+
+    if not await user_client.is_user_authorized():
+        raise RuntimeError(
+            "Telethon StringSession is no longer authorized."
+        )
+
+
 # =========================================================
 # TELEGRAM DEEP ANALYSIS
 # =========================================================
@@ -740,6 +755,8 @@ def user_activity(status: Any) -> dict[str, Any]:
 
 
 async def analyze_telegram(telegram_url: str) -> dict[str, Any]:
+    await ensure_user_client_connected()
+
     entity = await user_client.get_entity(telegram_url)
 
     owner: Optional[dict[str, Any]] = None
@@ -1061,7 +1078,15 @@ def admin_text(admin: dict[str, Any]) -> str:
 async def analyze_one(
     project: dict[str, Any],
 ) -> dict[str, Any]:
-    score = 20  # passed the market-cap and social-link fast filters
+    """
+    Deep-check one pending project.
+
+    X API payment or rate-limit errors do not automatically reject the
+    project. Telegram and project-quality signals can still qualify it.
+    """
+
+    # Passed market-cap and social-link discovery filters.
+    score = 30
     reasons: list[str] = []
 
     result: dict[str, Any] = {
@@ -1074,6 +1099,10 @@ async def analyze_one(
         "website": project.get("website"),
     }
 
+    # -----------------------------------------------------
+    # X ACTIVITY
+    # -----------------------------------------------------
+
     try:
         x_result = await asyncio.to_thread(
             X_API.latest_original_post,
@@ -1082,11 +1111,16 @@ async def analyze_one(
 
         if x_result.get("available"):
             created_at = x_result["created_at"]
+
             result["x_last_post_at"] = created_at.isoformat()
             result["x_status"] = (
-                "Active" if x_result["active"] else "Inactive"
+                "Active"
+                if x_result["active"]
+                else "Inactive"
             )
-            result["x_last_post_display"] = display_datetime(created_at)
+            result["x_last_post_display"] = display_datetime(
+                created_at
+            )
 
             if x_result["active"]:
                 score += 20
@@ -1095,21 +1129,75 @@ async def analyze_one(
                     f"Latest X post is older than "
                     f"{MAX_X_INACTIVE_DAYS} days"
                 )
+
         else:
-            result["x_status"] = "Unavailable"
+            result["x_status"] = "Not checked"
             result["x_last_post_display"] = "Unavailable"
-            reasons.append(
-                x_result.get(
-                    "reason",
-                    "X activity could not be checked",
-                )
+
+            reason = x_result.get(
+                "reason",
+                "X activity could not be checked",
             )
+
+            LOGGER.warning(
+                "X activity unavailable for @%s: %s",
+                project["x_username"],
+                reason,
+            )
+
+    except requests.HTTPError as error:
+        status_code = (
+            error.response.status_code
+            if error.response is not None
+            else None
+        )
+
+        result["x_last_post_display"] = "Unavailable"
+
+        if status_code == 402:
+            result["x_status"] = "Not checked"
+
+            LOGGER.warning(
+                "X API payment required for @%s. "
+                "Continuing without X scoring.",
+                project["x_username"],
+            )
+
+        elif status_code == 429:
+            result["x_status"] = "Rate limited"
+
+            LOGGER.warning(
+                "X API rate limited while checking @%s. "
+                "Continuing without X scoring.",
+                project["x_username"],
+            )
+
+        else:
+            result["x_status"] = "API error"
+
+            LOGGER.warning(
+                "X API returned HTTP %s for @%s.",
+                status_code,
+                project["x_username"],
+            )
+
     except Exception as error:
         result["x_status"] = "Error"
         result["x_last_post_display"] = "Unavailable"
-        reasons.append(f"X API error: {error}")
+
+        LOGGER.warning(
+            "X check failed for @%s: %s",
+            project["x_username"],
+            error,
+        )
+
+    # -----------------------------------------------------
+    # TELEGRAM ACTIVITY, OWNER AND ADMINS
+    # -----------------------------------------------------
 
     try:
+        await ensure_user_client_connected()
+
         tg = await analyze_telegram(
             project["telegram_url"]
         )
@@ -1145,7 +1233,10 @@ async def analyze_one(
                 "Owner is not publicly visible"
             )
 
-        score += min(len(tg["admins"]) * 4, 10)
+        score += min(
+            len(tg["admins"]) * 4,
+            10,
+        )
 
         if not tg["owner"] and not tg["admins"]:
             reasons.append(
@@ -1159,7 +1250,9 @@ async def analyze_one(
         result["telegram_status"] = "Inaccessible"
         result["admins"] = []
         result["owner"] = None
-        reasons.append("Telegram group is inaccessible")
+        reasons.append(
+            "Telegram group is inaccessible"
+        )
 
     except (
         UsernameInvalidError,
@@ -1169,24 +1262,104 @@ async def analyze_one(
         result["telegram_status"] = "Invalid"
         result["admins"] = []
         result["owner"] = None
-        reasons.append("Telegram group is invalid")
+        reasons.append(
+            "Telegram group is invalid"
+        )
 
     except RPCError as error:
         result["telegram_status"] = "Error"
         result["admins"] = []
         result["owner"] = None
-        reasons.append(f"Telegram error: {error}")
+        reasons.append(
+            f"Telegram error: {error}"
+        )
+
+    except Exception as error:
+        # Retry once when Telegram disconnected during a request.
+        if "disconnected" in str(error).lower():
+            try:
+                await ensure_user_client_connected()
+
+                tg = await analyze_telegram(
+                    project["telegram_url"]
+                )
+
+                result["telegram_last_message_at"] = (
+                    tg["last_message"].isoformat()
+                    if tg["last_message"]
+                    else None
+                )
+                result[
+                    "telegram_last_message_display"
+                ] = display_datetime(
+                    tg["last_message"]
+                )
+                result["telegram_messages_7d"] = (
+                    tg["messages_7d"]
+                )
+                result[
+                    "telegram_unique_humans_7d"
+                ] = tg["unique_humans_7d"]
+                result["telegram_status"] = tg["status"]
+                result["owner"] = tg["owner"]
+                result["admins"] = tg["admins"]
+
+                if tg["active"]:
+                    score += 20
+                else:
+                    reasons.append(
+                        "Telegram community did not meet "
+                        "the activity threshold"
+                    )
+
+                if tg["owner"]:
+                    score += 20
+                else:
+                    reasons.append(
+                        "Owner is not publicly visible"
+                    )
+
+                score += min(
+                    len(tg["admins"]) * 4,
+                    10,
+                )
+
+                if not tg["owner"] and not tg["admins"]:
+                    reasons.append(
+                        "No public human owner or admins"
+                    )
+
+            except Exception as retry_error:
+                result["telegram_status"] = "Disconnected"
+                result["admins"] = []
+                result["owner"] = None
+                reasons.append(
+                    "Telegram analysis failed after reconnect: "
+                    f"{retry_error}"
+                )
+
+        else:
+            result["telegram_status"] = "Error"
+            result["admins"] = []
+            result["owner"] = None
+            reasons.append(
+                f"Telegram analysis failed: {error}"
+            )
+
+    # -----------------------------------------------------
+    # WEBSITE AND FINAL SCORE
+    # -----------------------------------------------------
 
     if project.get("website"):
         score += 10
 
-    if score >= 90:
+    if score >= 80:
         stage = "priority"
         classification = "🔥 Priority"
-    elif score >= 70:
+    elif score >= 60:
         stage = "qualified"
         classification = "✅ Qualified"
-    elif score >= 50:
+    elif score >= 40:
         stage = "watchlist"
         classification = "🟡 Watchlist"
     else:
@@ -1202,13 +1375,19 @@ async def analyze_one(
             "stage": stage,
             "classification": classification,
             "rejection_reason": (
-                "; ".join(reasons) if reasons else None
+                "; ".join(reasons)
+                if reasons
+                else None
             ),
             "owner_username": (
-                owner["username"] if owner else None
+                owner["username"]
+                if owner
+                else None
             ),
             "owner_activity": (
-                owner["activity"] if owner else None
+                owner["activity"]
+                if owner
+                else None
             ),
             "admin_1": (
                 admin_text(admins[0])
@@ -1229,7 +1408,6 @@ async def analyze_one(
     )
 
     return result
-
 
 def format_analysis(result: dict[str, Any]) -> str:
     lines = [
@@ -1286,6 +1464,8 @@ async def run_deep_analysis(
     event: events.NewMessage.Event,
     limit: int,
 ) -> None:
+    await ensure_user_client_connected()
+
     chat_id = event.chat_id
 
     if chat_id in active_jobs:
@@ -1652,6 +1832,21 @@ async def count_handler(event: events.NewMessage.Event) -> None:
 # STARTUP
 # =========================================================
 
+async def user_client_keepalive() -> None:
+    """Periodically reconnect the personal Telegram client."""
+
+    while True:
+        try:
+            await ensure_user_client_connected()
+        except Exception as error:
+            LOGGER.error(
+                "Telethon keepalive failed: %s",
+                error,
+            )
+
+        await asyncio.sleep(60)
+
+
 async def main() -> None:
     await user_client.start()
     await bot_client.start(bot_token=BOT_TOKEN)
@@ -1663,7 +1858,25 @@ async def main() -> None:
         bot.username,
     )
 
-    await bot_client.run_until_disconnected()
+    keepalive_task = asyncio.create_task(
+        user_client_keepalive()
+    )
+
+    try:
+        await bot_client.run_until_disconnected()
+    finally:
+        keepalive_task.cancel()
+
+        await asyncio.gather(
+            keepalive_task,
+            return_exceptions=True,
+        )
+
+        if bot_client.is_connected():
+            await bot_client.disconnect()
+
+        if user_client.is_connected():
+            await user_client.disconnect()
 
 
 if __name__ == "__main__":
