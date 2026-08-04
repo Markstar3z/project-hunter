@@ -92,15 +92,24 @@ user_client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH,
+    auto_reconnect=True,
+    connection_retries=10,
+    retry_delay=3,
+    request_retries=5,
 )
 
 bot_client = TelegramClient(
     MemorySession(),
     API_ID,
     API_HASH,
+    auto_reconnect=True,
+    connection_retries=10,
+    retry_delay=3,
+    request_retries=5,
 )
 
 active_jobs: set[int] = set()
+user_connection_lock = asyncio.Lock()
 
 
 # =========================================================
@@ -746,17 +755,46 @@ X_API = XClient()
 
 
 async def ensure_user_client_connected() -> None:
-    """Reconnect the personal Telethon client when Railway drops it."""
+    """Ensure the personal Telethon session is connected and authorized."""
 
-    if not user_client.is_connected():
-        LOGGER.warning(
-            "Telethon user client disconnected. Reconnecting..."
-        )
-        await user_client.connect()
+    async with user_connection_lock:
+        for attempt in range(1, 4):
+            try:
+                if not user_client.is_connected():
+                    LOGGER.warning(
+                        "Personal Telegram client disconnected. "
+                        "Reconnect attempt %s/3.",
+                        attempt,
+                    )
+                    await user_client.connect()
 
-    if not await user_client.is_user_authorized():
+                if not await user_client.is_user_authorized():
+                    raise RuntimeError(
+                        "STRING_SESSION is invalid or no longer authorized."
+                    )
+
+                # A lightweight API call confirms the sender is usable.
+                await user_client.get_me()
+                return
+
+            except Exception as error:
+                LOGGER.warning(
+                    "Personal Telegram connection attempt %s failed: %s",
+                    attempt,
+                    error,
+                )
+
+                try:
+                    if user_client.is_connected():
+                        await user_client.disconnect()
+                except Exception:
+                    pass
+
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 2)
+
         raise RuntimeError(
-            "Telethon StringSession is no longer authorized."
+            "Personal Telegram account could not reconnect after 3 attempts."
         )
 
 
@@ -1768,6 +1806,32 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+async def safe_event_reply(
+    event: events.NewMessage.Event,
+    text: str,
+) -> Optional[Any]:
+    """Reply to commands while logging delivery failures."""
+
+    try:
+        return await event.reply(
+            text,
+            link_preview=False,
+        )
+    except FloodWaitError as error:
+        await asyncio.sleep(error.seconds + 1)
+        return await event.reply(
+            text,
+            link_preview=False,
+        )
+    except Exception as error:
+        LOGGER.exception(
+            "Could not reply to chat %s: %s",
+            event.chat_id,
+            error,
+        )
+        return None
+
+
 # =========================================================
 # BOT COMMANDS
 # =========================================================
@@ -1778,9 +1842,17 @@ async def start_handler(event: events.NewMessage.Event) -> None:
         await event.reply("This bot is private.")
         return
 
-    await event.reply(
+    personal_status = (
+        "connected"
+        if user_client.is_connected()
+        else "temporarily disconnected"
+    )
+
+    await safe_event_reply(
+        event,
         (
-            "Project Hunter v2\n\n"
+            "Project Hunter v2 is online ✅\n\n"
+            f"Personal Telegram session: {personal_status}\n\n"
             "Fast discovery:\n"
             "/scan\n"
             "/scan 50\n"
@@ -1795,9 +1867,9 @@ async def start_handler(event: events.NewMessage.Event) -> None:
             "/watchlist\n"
             "/rejected\n"
             "/latest\n"
-            "/count"
+            "/count\n"
+            "/status"
         ),
-        link_preview=False,
     )
 
 
@@ -1902,35 +1974,121 @@ async def count_handler(event: events.NewMessage.Event) -> None:
     )
 
 
+@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
+async def status_handler(event: events.NewMessage.Event) -> None:
+    if not authorized(event):
+        await safe_event_reply(event, "This bot is private.")
+        return
+
+    bot_ok = bot_client.is_connected()
+    user_ok = user_client.is_connected()
+    authorization = "unknown"
+
+    try:
+        await ensure_user_client_connected()
+        user_ok = True
+        authorization = "authorized"
+    except Exception as error:
+        user_ok = False
+        authorization = f"error: {error}"
+
+    counts = STORAGE.counts()
+
+    await safe_event_reply(
+        event,
+        (
+            "Project Hunter status\n\n"
+            f"Bot connection: {'online' if bot_ok else 'offline'}\n"
+            f"Personal session: {'online' if user_ok else 'offline'}\n"
+            f"Authorization: {authorization}\n"
+            f"Database total: {counts['total']}\n"
+            f"Pending: {counts['pending']}"
+        ),
+    )
+
+
+@bot_client.on(events.NewMessage)
+async def unknown_command_handler(event: events.NewMessage.Event) -> None:
+    """Confirm that the bot is receiving messages."""
+
+    text = (event.raw_text or "").strip()
+
+    if not text or not text.startswith("/"):
+        return
+
+    known = (
+        "/start",
+        "/scan",
+        "/analyze",
+        "/pending",
+        "/priority",
+        "/qualified",
+        "/watchlist",
+        "/rejected",
+        "/latest",
+        "/count",
+        "/status",
+    )
+
+    command = text.split()[0].split("@")[0].lower()
+
+    if command not in known and authorized(event):
+        await safe_event_reply(
+            event,
+            "Unknown command. Send /start to view available commands.",
+        )
+
+
 # =========================================================
 # STARTUP
 # =========================================================
 
 async def user_client_keepalive() -> None:
-    """Periodically reconnect the personal Telegram client."""
+    """Keep the personal Telegram session connected in Railway."""
 
     while True:
         try:
             await ensure_user_client_connected()
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             LOGGER.error(
-                "Telethon keepalive failed: %s",
+                "Personal Telegram keepalive failed: %s",
                 error,
             )
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 async def main() -> None:
-    await user_client.start()
+    # Start the BotFather bot first so /start and /status work even when
+    # the personal Telegram session has a temporary connection problem.
     await bot_client.start(bot_token=BOT_TOKEN)
 
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter v2 connected as @%s",
+        "Project Hunter bot connected as @%s",
         bot.username,
     )
+
+    try:
+        await ensure_user_client_connected()
+        personal = await user_client.get_me()
+        LOGGER.info(
+            "Personal Telegram session connected as %s",
+            (
+                f"@{personal.username}"
+                if getattr(personal, "username", None)
+                else getattr(personal, "first_name", "Unknown")
+            ),
+        )
+    except Exception as error:
+        LOGGER.error(
+            "Personal Telegram session did not connect at startup: %s. "
+            "The bot will remain online and keep retrying.",
+            error,
+        )
 
     keepalive_task = asyncio.create_task(
         user_client_keepalive()
@@ -1958,3 +2116,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         LOGGER.info("Bot stopped manually.")
+    except Exception:
+        LOGGER.exception("Project Hunter stopped unexpectedly.")
+        raise
