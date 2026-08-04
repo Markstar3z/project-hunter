@@ -222,6 +222,7 @@ class Storage:
             os.makedirs(parent, exist_ok=True)
 
         self.initialize()
+        self.migrate_database()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -279,6 +280,79 @@ class Storage:
                     error_message TEXT
                 )
                 """
+            )
+
+            connection.commit()
+
+    def migrate_database(self) -> None:
+        """Upgrade older Railway SQLite databases without deleting data."""
+
+        required_columns = {
+            "category": "TEXT",
+            "website": "TEXT",
+            "x_username": "TEXT",
+            "x_url": "TEXT",
+            "telegram_url": "TEXT",
+            "stage": "TEXT NOT NULL DEFAULT 'pending'",
+            "score": "INTEGER DEFAULT 0",
+            "classification": "TEXT",
+            "rejection_reason": "TEXT",
+            "x_last_post_at": "TEXT",
+            "x_status": "TEXT",
+            "telegram_last_message_at": "TEXT",
+            "telegram_messages_7d": "INTEGER DEFAULT 0",
+            "telegram_unique_humans_7d": "INTEGER DEFAULT 0",
+            "telegram_status": "TEXT",
+            "owner_username": "TEXT",
+            "owner_activity": "TEXT",
+            "admin_1": "TEXT",
+            "admin_2": "TEXT",
+            "admin_3": "TEXT",
+            "discovered_at": "TEXT",
+            "analyzed_at": "TEXT",
+        }
+
+        with self.connect() as connection:
+            existing_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(projects)"
+                ).fetchall()
+            }
+
+            for column_name, column_definition in required_columns.items():
+                if column_name in existing_columns:
+                    continue
+
+                connection.execute(
+                    f"ALTER TABLE projects "
+                    f"ADD COLUMN {column_name} "
+                    f"{column_definition}"
+                )
+
+            connection.execute(
+                """
+                UPDATE projects
+                SET stage = COALESCE(NULLIF(stage, ''), 'pending')
+                """
+            )
+
+            connection.execute(
+                """
+                UPDATE projects
+                SET score = COALESCE(score, 0)
+                """
+            )
+
+            connection.execute(
+                """
+                UPDATE projects
+                SET discovered_at = COALESCE(
+                    discovered_at,
+                    ?
+                )
+                """,
+                (utc_now().isoformat(),),
             )
 
             connection.commit()
