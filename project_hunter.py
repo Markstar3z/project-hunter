@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import re
@@ -56,9 +57,9 @@ ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "10000"))
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP", "1000000000"))
 
-FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "500"))
-MAX_PAGES_PER_FAST_SCAN = int(os.getenv("MAX_PAGES_PER_FAST_SCAN", "5"))
-PAGE_SIZE = min(int(os.getenv("PAGE_SIZE", "250")), 250)
+FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "250"))
+MAX_PAGES_PER_FAST_SCAN = int(os.getenv("MAX_PAGES_PER_FAST_SCAN", "3"))
+PAGE_SIZE = min(int(os.getenv("PAGE_SIZE", "100")), 100)
 
 MAX_X_INACTIVE_DAYS = int(os.getenv("MAX_X_INACTIVE_DAYS", "30"))
 MAX_TG_INACTIVE_DAYS = int(os.getenv("MAX_TG_INACTIVE_DAYS", "30"))
@@ -68,6 +69,10 @@ TG_MIN_HUMAN_SENDERS_7D = int(os.getenv("TG_MIN_HUMAN_SENDERS_7D", "2"))
 
 MAX_ACTIVE_ADMINS = 3
 MESSAGE_LIMIT = 3800
+TG_MESSAGE_SCAN_LIMIT = int(os.getenv("TG_MESSAGE_SCAN_LIMIT", "150"))
+ENTITY_CACHE_LIMIT_USER = int(os.getenv("ENTITY_CACHE_LIMIT_USER", "200"))
+ENTITY_CACHE_LIMIT_BOT = int(os.getenv("ENTITY_CACHE_LIMIT_BOT", "100"))
+GC_EVERY_N_PROJECTS = int(os.getenv("GC_EVERY_N_PROJECTS", "10"))
 
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 X_API_BASE = "https://api.x.com/2"
@@ -92,24 +97,15 @@ user_client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH,
-    auto_reconnect=True,
-    connection_retries=10,
-    retry_delay=3,
-    request_retries=5,
 )
 
 bot_client = TelegramClient(
     MemorySession(),
     API_ID,
     API_HASH,
-    auto_reconnect=True,
-    connection_retries=10,
-    retry_delay=3,
-    request_retries=5,
 )
 
 active_jobs: set[int] = set()
-user_connection_lock = asyncio.Lock()
 
 
 # =========================================================
@@ -200,8 +196,8 @@ def build_http_session() -> requests.Session:
 
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=20,
-        pool_maxsize=20,
+        pool_connections=5,
+        pool_maxsize=5,
     )
 
     session = requests.Session()
@@ -755,46 +751,17 @@ X_API = XClient()
 
 
 async def ensure_user_client_connected() -> None:
-    """Ensure the personal Telethon session is connected and authorized."""
+    """Reconnect the personal Telethon client when Railway drops it."""
 
-    async with user_connection_lock:
-        for attempt in range(1, 4):
-            try:
-                if not user_client.is_connected():
-                    LOGGER.warning(
-                        "Personal Telegram client disconnected. "
-                        "Reconnect attempt %s/3.",
-                        attempt,
-                    )
-                    await user_client.connect()
+    if not user_client.is_connected():
+        LOGGER.warning(
+            "Telethon user client disconnected. Reconnecting..."
+        )
+        await user_client.connect()
 
-                if not await user_client.is_user_authorized():
-                    raise RuntimeError(
-                        "STRING_SESSION is invalid or no longer authorized."
-                    )
-
-                # A lightweight API call confirms the sender is usable.
-                await user_client.get_me()
-                return
-
-            except Exception as error:
-                LOGGER.warning(
-                    "Personal Telegram connection attempt %s failed: %s",
-                    attempt,
-                    error,
-                )
-
-                try:
-                    if user_client.is_connected():
-                        await user_client.disconnect()
-                except Exception:
-                    pass
-
-                if attempt < 3:
-                    await asyncio.sleep(attempt * 2)
-
+    if not await user_client.is_user_authorized():
         raise RuntimeError(
-            "Personal Telegram account could not reconnect after 3 attempts."
+            "Telethon StringSession is no longer authorized."
         )
 
 
@@ -933,7 +900,7 @@ async def analyze_telegram(telegram_url: str) -> dict[str, Any]:
 
     async for message in user_client.iter_messages(
         entity,
-        limit=500,
+        limit=TG_MESSAGE_SCAN_LIMIT,
     ):
         if not message.date:
             continue
@@ -948,14 +915,10 @@ async def analyze_telegram(telegram_url: str) -> dict[str, Any]:
 
         message_count += 1
 
-        sender = await message.get_sender()
-
-        if (
-            sender is not None
-            and not getattr(sender, "bot", False)
-            and getattr(sender, "id", None)
-        ):
-            human_senders.add(sender.id)
+        # Low-memory mode: use sender_id directly instead of fetching
+        # every sender entity with message.get_sender().
+        if message.sender_id:
+            human_senders.add(int(message.sender_id))
 
     if last_message is None:
         status = "Unknown"
@@ -1003,8 +966,10 @@ async def run_fast_scan(
 ) -> None:
     chat_id = event.chat_id
 
-    if chat_id in active_jobs:
-        await event.reply("A job is already running in this chat.")
+    if active_jobs:
+        await event.reply(
+            "A job is already running. Wait for it to finish."
+        )
         return
 
     active_jobs.add(chat_id)
@@ -1022,10 +987,14 @@ async def run_fast_scan(
     )
 
     inspected = 0
-    found: list[dict[str, Any]] = []
+    found_count = 0
+    preview_blocks: list[str] = []
 
     try:
-        for page in range(1, MAX_PAGES_PER_FAST_SCAN + 1):
+        for page in range(
+            1,
+            MAX_PAGES_PER_FAST_SCAN + 1,
+        ):
             market_page = await asyncio.to_thread(
                 COINGECKO.market_page,
                 page,
@@ -1054,8 +1023,13 @@ async def run_fast_scan(
 
                 coin_id = coin.get("id")
 
-                if not coin_id or STORAGE.exists(coin_id):
+                if (
+                    not coin_id
+                    or STORAGE.exists(coin_id)
+                ):
                     continue
+
+                details = None
 
                 try:
                     details = await asyncio.to_thread(
@@ -1076,13 +1050,16 @@ async def run_fast_scan(
                     links.get("twitter_screen_name") or ""
                 ).strip().lstrip("@")
 
-                telegram_url = COINGECKO.telegram_url(
-                    links.get(
-                        "telegram_channel_identifier"
+                telegram_url = (
+                    COINGECKO.telegram_url(
+                        links.get(
+                            "telegram_channel_identifier"
+                        )
                     )
                 )
 
                 if not x_username or not telegram_url:
+                    details = None
                     continue
 
                 website = COINGECKO.website_url(
@@ -1091,47 +1068,85 @@ async def run_fast_scan(
 
                 project = {
                     "coin_id": coin_id,
-                    "name": str(coin.get("name") or ""),
+                    "name": str(
+                        coin.get("name") or ""
+                    ),
                     "symbol": str(
                         coin.get("symbol") or ""
                     ).upper(),
                     "market_cap": market_cap,
-                    "category": params.category_name or "All",
+                    "category": (
+                        params.category_name or "All"
+                    ),
                     "website": website,
                     "x_username": x_username,
-                    "x_url": f"https://x.com/{x_username}",
+                    "x_url": (
+                        f"https://x.com/{x_username}"
+                    ),
                     "telegram_url": telegram_url,
                 }
 
                 STORAGE.save_pending(project)
-                found.append(project)
+                found_count += 1
+
+                # Keep only small strings for the final preview instead
+                # of retaining full CoinGecko project dictionaries.
+                preview_blocks.append(
+                    (
+                        f"{found_count}.\n"
+                        f"Project: {project['name']} "
+                        f"(${project['symbol']})\n"
+                        f"Market cap: "
+                        f"${project['market_cap']:,}\n"
+                        f"X: {project['x_url']}\n"
+                        f"TG: {project['telegram_url']}"
+                    )
+                )
 
                 await progress.edit(
                     (
                         "⚡ Fast scan running\n\n"
                         f"Inspected: {inspected}/"
                         f"{FAST_SCAN_MAX_INSPECTED}\n"
-                        f"Candidates found: {len(found)}/"
+                        f"Candidates found: "
+                        f"{found_count}/"
                         f"{params.target_count}\n"
                         f"Current: {project['name']}"
                     )
                 )
 
-                if len(found) >= params.target_count:
+                project = None
+                details = None
+                links = None
+
+                if (
+                    GC_EVERY_N_PROJECTS > 0
+                    and found_count
+                    % GC_EVERY_N_PROJECTS
+                    == 0
+                ):
+                    gc.collect()
+
+                if found_count >= params.target_count:
                     break
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.25)
+
+            # Drop the page response before loading another one.
+            market_page = None
+            gc.collect()
 
             if (
-                len(found) >= params.target_count
-                or inspected >= FAST_SCAN_MAX_INSPECTED
+                found_count >= params.target_count
+                or inspected
+                >= FAST_SCAN_MAX_INSPECTED
             ):
                 break
 
         STORAGE.finish_history(
             history_id,
             inspected=inspected,
-            found=len(found),
+            found=found_count,
             status="completed",
         )
 
@@ -1139,26 +1154,17 @@ async def run_fast_scan(
             (
                 "✅ Fast scan completed\n\n"
                 f"Inspected: {inspected}\n"
-                f"Candidates saved: {len(found)}\n\n"
+                f"Candidates saved: {found_count}\n\n"
                 "Run /analyze to perform the deep checks."
             )
         )
 
-        if found:
-            output = "NEW CANDIDATES\n\n" + "\n\n".join(
-                (
-                    f"{number}.\n"
-                    f"Project: {project['name']} "
-                    f"(${project['symbol']})\n"
-                    f"Market cap: "
-                    f"${project['market_cap']:,}\n"
-                    f"X: {project['x_url']}\n"
-                    f"TG: {project['telegram_url']}"
-                )
-                for number, project in enumerate(found, start=1)
+        if preview_blocks:
+            await send_long(
+                event,
+                "NEW CANDIDATES\n\n"
+                + "\n\n".join(preview_blocks),
             )
-
-            await send_long(event, output)
 
     except Exception as error:
         LOGGER.exception("Fast scan failed")
@@ -1166,16 +1172,21 @@ async def run_fast_scan(
         STORAGE.finish_history(
             history_id,
             inspected=inspected,
-            found=len(found),
+            found=found_count,
             status="failed",
             error_message=str(error),
         )
 
         await progress.edit(
-            f"❌ Fast scan failed\n\n{type(error).__name__}: {error}"
+            (
+                "❌ Fast scan failed\n\n"
+                f"{type(error).__name__}: {error}"
+            )
         )
 
     finally:
+        preview_blocks.clear()
+        gc.collect()
         active_jobs.discard(chat_id)
 
 
@@ -1580,8 +1591,10 @@ async def run_deep_analysis(
 
     chat_id = event.chat_id
 
-    if chat_id in active_jobs:
-        await event.reply("A job is already running in this chat.")
+    if active_jobs:
+        await event.reply(
+            "A job is already running. Wait for it to finish."
+        )
         return
 
     pending = STORAGE.pending_projects(limit)
@@ -1593,121 +1606,172 @@ async def run_deep_analysis(
         return
 
     active_jobs.add(chat_id)
+
+    total_pending = len(pending)
+
     history_id = STORAGE.create_history(
         "deep_analysis",
-        len(pending),
+        total_pending,
     )
 
     progress = await event.reply(
         (
             "🔬 Deep analysis started\n\n"
-            f"Candidates: {len(pending)}"
+            f"Candidates: {total_pending}"
         )
     )
 
-    results: list[dict[str, Any]] = []
+    priority_count = 0
+    qualified_count = 0
+    watchlist_count = 0
+    rejected_count = 0
+    processed_count = 0
+
+    # Store only the report text for non-rejected projects.
+    # Full result dictionaries are written to SQLite immediately.
+    report_blocks: dict[str, list[str]] = {
+        "priority": [],
+        "qualified": [],
+        "watchlist": [],
+    }
 
     try:
-        for number, project in enumerate(pending, start=1):
+        for number, project in enumerate(
+            pending,
+            start=1,
+        ):
             await progress.edit(
                 (
                     "🔬 Deep analysis running\n\n"
-                    f"Progress: {number - 1}/{len(pending)}\n"
+                    f"Progress: "
+                    f"{number - 1}/{total_pending}\n"
                     f"Current: {project['name']}"
                 )
             )
 
             try:
                 result = await analyze_one(project)
+
             except FloodWaitError as error:
                 await progress.edit(
                     (
                         "⏳ Telegram rate limit\n\n"
-                        f"Waiting {error.seconds} seconds..."
+                        f"Waiting "
+                        f"{error.seconds} seconds..."
                     )
                 )
-                await asyncio.sleep(error.seconds + 1)
+                await asyncio.sleep(
+                    error.seconds + 1
+                )
                 result = await analyze_one(project)
 
             STORAGE.save_analysis(result)
-            results.append(result)
+            processed_count += 1
+
+            stage = result["stage"]
+
+            if stage == "priority":
+                priority_count += 1
+                report_blocks["priority"].append(
+                    format_analysis(result)
+                )
+
+            elif stage == "qualified":
+                qualified_count += 1
+                report_blocks["qualified"].append(
+                    format_analysis(result)
+                )
+
+            elif stage == "watchlist":
+                watchlist_count += 1
+                report_blocks["watchlist"].append(
+                    format_analysis(result)
+                )
+
+            else:
+                rejected_count += 1
 
             await progress.edit(
                 (
                     "🔬 Deep analysis running\n\n"
-                    f"Progress: {number}/{len(pending)}\n"
+                    f"Progress: "
+                    f"{number}/{total_pending}\n"
                     f"Current: {project['name']}\n"
-                    f"Result: {result['classification']} "
+                    f"Result: "
+                    f"{result['classification']} "
                     f"({result['score']}/100)"
                 )
             )
 
-            await asyncio.sleep(1)
+            # Release large Telegram/CoinGecko-derived structures
+            # as soon as they have been saved and formatted.
+            result = None
+            project = None
+
+            if (
+                GC_EVERY_N_PROJECTS > 0
+                and processed_count
+                % GC_EVERY_N_PROJECTS
+                == 0
+            ):
+                gc.collect()
+
+            await asyncio.sleep(0.5)
 
         STORAGE.finish_history(
             history_id,
-            inspected=len(pending),
-            found=len(results),
+            inspected=processed_count,
+            found=processed_count,
             status="completed",
         )
-
-        priority = [
-            item for item in results
-            if item["stage"] == "priority"
-        ]
-        qualified = [
-            item for item in results
-            if item["stage"] == "qualified"
-        ]
-        watchlist = [
-            item for item in results
-            if item["stage"] == "watchlist"
-        ]
-        rejected = [
-            item for item in results
-            if item["stage"] == "rejected"
-        ]
 
         await progress.edit(
             (
                 "✅ Deep analysis completed\n\n"
-                f"Priority: {len(priority)}\n"
-                f"Qualified: {len(qualified)}\n"
-                f"Watchlist: {len(watchlist)}\n"
-                f"Rejected: {len(rejected)}"
+                f"Priority: {priority_count}\n"
+                f"Qualified: {qualified_count}\n"
+                f"Watchlist: {watchlist_count}\n"
+                f"Rejected: {rejected_count}"
             )
         )
 
-        for heading, group in (
-            ("🔥 PRIORITY PROJECTS", priority),
-            ("✅ QUALIFIED PROJECTS", qualified),
-            ("🟡 WATCHLIST", watchlist),
-        ):
-            if group:
+        headings = {
+            "priority": "🔥 PRIORITY PROJECTS",
+            "qualified": "✅ QUALIFIED PROJECTS",
+            "watchlist": "🟡 WATCHLIST",
+        }
+
+        for stage, heading in headings.items():
+            blocks = report_blocks[stage]
+
+            if blocks:
                 await send_long(
                     event,
                     f"{heading}\n\n"
-                    + "\n\n".join(
-                        format_analysis(item)
-                        for item in group
-                    ),
+                    + "\n\n".join(blocks),
                 )
 
-        if rejected:
+                blocks.clear()
+                gc.collect()
+
+        if rejected_count:
             await event.reply(
                 (
-                    f"❌ Rejected projects: {len(rejected)}\n\n"
+                    f"❌ Rejected projects: "
+                    f"{rejected_count}\n\n"
                     "Use /rejected to view them."
                 )
             )
 
     except Exception as error:
-        LOGGER.exception("Deep analysis failed")
+        LOGGER.exception(
+            "Deep analysis failed"
+        )
 
         STORAGE.finish_history(
             history_id,
-            inspected=len(results),
-            found=len(results),
+            inspected=processed_count,
+            found=processed_count,
             status="failed",
             error_message=str(error),
         )
@@ -1720,6 +1784,12 @@ async def run_deep_analysis(
         )
 
     finally:
+        pending.clear()
+
+        for blocks in report_blocks.values():
+            blocks.clear()
+
+        gc.collect()
         active_jobs.discard(chat_id)
 
 
@@ -1806,32 +1876,6 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
-async def safe_event_reply(
-    event: events.NewMessage.Event,
-    text: str,
-) -> Optional[Any]:
-    """Reply to commands while logging delivery failures."""
-
-    try:
-        return await event.reply(
-            text,
-            link_preview=False,
-        )
-    except FloodWaitError as error:
-        await asyncio.sleep(error.seconds + 1)
-        return await event.reply(
-            text,
-            link_preview=False,
-        )
-    except Exception as error:
-        LOGGER.exception(
-            "Could not reply to chat %s: %s",
-            event.chat_id,
-            error,
-        )
-        return None
-
-
 # =========================================================
 # BOT COMMANDS
 # =========================================================
@@ -1842,17 +1886,9 @@ async def start_handler(event: events.NewMessage.Event) -> None:
         await event.reply("This bot is private.")
         return
 
-    personal_status = (
-        "connected"
-        if user_client.is_connected()
-        else "temporarily disconnected"
-    )
-
-    await safe_event_reply(
-        event,
+    await event.reply(
         (
-            "Project Hunter v2 is online ✅\n\n"
-            f"Personal Telegram session: {personal_status}\n\n"
+            "Project Hunter v2\n\n"
             "Fast discovery:\n"
             "/scan\n"
             "/scan 50\n"
@@ -1867,9 +1903,9 @@ async def start_handler(event: events.NewMessage.Event) -> None:
             "/watchlist\n"
             "/rejected\n"
             "/latest\n"
-            "/count\n"
-            "/status"
+            "/count"
         ),
+        link_preview=False,
     )
 
 
@@ -1974,121 +2010,44 @@ async def count_handler(event: events.NewMessage.Event) -> None:
     )
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
-async def status_handler(event: events.NewMessage.Event) -> None:
-    if not authorized(event):
-        await safe_event_reply(event, "This bot is private.")
-        return
-
-    bot_ok = bot_client.is_connected()
-    user_ok = user_client.is_connected()
-    authorization = "unknown"
-
-    try:
-        await ensure_user_client_connected()
-        user_ok = True
-        authorization = "authorized"
-    except Exception as error:
-        user_ok = False
-        authorization = f"error: {error}"
-
-    counts = STORAGE.counts()
-
-    await safe_event_reply(
-        event,
-        (
-            "Project Hunter status\n\n"
-            f"Bot connection: {'online' if bot_ok else 'offline'}\n"
-            f"Personal session: {'online' if user_ok else 'offline'}\n"
-            f"Authorization: {authorization}\n"
-            f"Database total: {counts['total']}\n"
-            f"Pending: {counts['pending']}"
-        ),
-    )
-
-
-@bot_client.on(events.NewMessage)
-async def unknown_command_handler(event: events.NewMessage.Event) -> None:
-    """Confirm that the bot is receiving messages."""
-
-    text = (event.raw_text or "").strip()
-
-    if not text or not text.startswith("/"):
-        return
-
-    known = (
-        "/start",
-        "/scan",
-        "/analyze",
-        "/pending",
-        "/priority",
-        "/qualified",
-        "/watchlist",
-        "/rejected",
-        "/latest",
-        "/count",
-        "/status",
-    )
-
-    command = text.split()[0].split("@")[0].lower()
-
-    if command not in known and authorized(event):
-        await safe_event_reply(
-            event,
-            "Unknown command. Send /start to view available commands.",
-        )
-
-
 # =========================================================
 # STARTUP
 # =========================================================
 
 async def user_client_keepalive() -> None:
-    """Keep the personal Telegram session connected in Railway."""
+    """Periodically reconnect the personal Telegram client."""
 
     while True:
         try:
             await ensure_user_client_connected()
-        except asyncio.CancelledError:
-            raise
         except Exception as error:
             LOGGER.error(
-                "Personal Telegram keepalive failed: %s",
+                "Telethon keepalive failed: %s",
                 error,
             )
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 async def main() -> None:
-    # Start the BotFather bot first so /start and /status work even when
-    # the personal Telegram session has a temporary connection problem.
+    await user_client.start()
     await bot_client.start(bot_token=BOT_TOKEN)
 
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter bot connected as @%s",
+        "Project Hunter v2 connected as @%s",
         bot.username,
     )
-
-    try:
-        await ensure_user_client_connected()
-        personal = await user_client.get_me()
-        LOGGER.info(
-            "Personal Telegram session connected as %s",
-            (
-                f"@{personal.username}"
-                if getattr(personal, "username", None)
-                else getattr(personal, "first_name", "Unknown")
-            ),
-        )
-    except Exception as error:
-        LOGGER.error(
-            "Personal Telegram session did not connect at startup: %s. "
-            "The bot will remain online and keep retrying.",
-            error,
-        )
+    LOGGER.info(
+        "Low-memory mode active: page_size=%s, "
+        "max_inspected=%s, tg_message_limit=%s, "
+        "user_entity_cache=%s",
+        PAGE_SIZE,
+        FAST_SCAN_MAX_INSPECTED,
+        TG_MESSAGE_SCAN_LIMIT,
+        ENTITY_CACHE_LIMIT_USER,
+    )
 
     keepalive_task = asyncio.create_task(
         user_client_keepalive()
@@ -2116,6 +2075,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         LOGGER.info("Bot stopped manually.")
-    except Exception:
-        LOGGER.exception("Project Hunter stopped unexpectedly.")
-        raise
