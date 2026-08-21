@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import (
     ChannelPrivateError,
     ChatAdminRequiredError,
@@ -49,6 +49,8 @@ STRING_SESSION = os.environ["STRING_SESSION"]
 
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
+MOBULA_API_KEY = os.getenv("MOBULA_API_KEY", "").strip()
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/project_hunter.db")
 ALLOWED_CHAT_ID_RAW = os.getenv("ALLOWED_CHAT_ID", "").strip()
@@ -56,6 +58,12 @@ ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 
 MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "10000"))
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP", "1000000000"))
+
+MEME_MIN_MARKET_CAP = int(os.getenv("MEME_MIN_MARKET_CAP", "10000"))
+MEME_MAX_MARKET_CAP = int(os.getenv("MEME_MAX_MARKET_CAP", "50000000"))
+MEME_MIN_LIQUIDITY = float(os.getenv("MEME_MIN_LIQUIDITY", "5000"))
+MEME_MIN_VOLUME_24H = float(os.getenv("MEME_MIN_VOLUME_24H", "5000"))
+MEME_DEFAULT_CHAIN = os.getenv("MEME_DEFAULT_CHAIN", "solana").strip().lower()
 
 FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "250"))
 MAX_PAGES_PER_FAST_SCAN = int(os.getenv("MAX_PAGES_PER_FAST_SCAN", "3"))
@@ -76,6 +84,9 @@ GC_EVERY_N_PROJECTS = int(os.getenv("GC_EVERY_N_PROJECTS", "10"))
 
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 X_API_BASE = "https://api.x.com/2"
+MOBULA_API_BASE = "https://api.mobula.io/api"
+BIRDEYE_API_BASE = "https://public-api.birdeye.so"
+DEXSCREENER_API_BASE = "https://api.dexscreener.com"
 
 
 # =========================================================
@@ -107,6 +118,10 @@ bot_client = TelegramClient(
 
 active_jobs: set[int] = set()
 
+# Per-chat temporary menu state. It only stores the current scan choices,
+# not project data or API responses.
+scan_ui_state: dict[int, dict[str, Any]] = {}
+
 
 # =========================================================
 # HELPERS
@@ -115,9 +130,61 @@ active_jobs: set[int] = set()
 @dataclass
 class FastScanParams:
     target_count: int = 50
+    asset_type: str = "alt"
+    sector: str = "all"
+    source: str = "coingecko"
+    launchpad: str = "all"
+    chain: str = "all"
     category_id: Optional[str] = None
     category_name: Optional[str] = None
     sort_mode: str = "market_cap_desc"
+
+
+@dataclass
+class DiscoveryCandidate:
+    unique_id: str
+    name: str
+    symbol: str
+    market_cap: int = 0
+    source: str = ""
+    asset_type: str = "alt"
+    sector: str = "all"
+    chain: str = ""
+    contract_address: str = ""
+    launchpad: str = ""
+    website: Optional[str] = None
+    x_username: str = ""
+    x_url: str = ""
+    telegram_url: str = ""
+    external_url: str = ""
+    liquidity: float = 0.0
+    volume_24h: float = 0.0
+    pair_created_at: Optional[int] = None
+    metadata: Optional[dict[str, Any]] = None
+
+    def to_project(self) -> dict[str, Any]:
+        return {
+            "coin_id": self.unique_id,
+            "name": self.name,
+            "symbol": self.symbol,
+            "market_cap": int(self.market_cap or 0),
+            "category": self.sector or "all",
+            "sector": self.sector or "all",
+            "source": self.source,
+            "sources": self.source,
+            "asset_type": self.asset_type,
+            "chain": self.chain,
+            "contract_address": self.contract_address,
+            "launchpad": self.launchpad,
+            "website": self.website,
+            "x_username": self.x_username,
+            "x_url": self.x_url,
+            "telegram_url": self.telegram_url,
+            "external_url": self.external_url,
+            "liquidity": float(self.liquidity or 0),
+            "volume_24h": float(self.volume_24h or 0),
+            "pair_created_at": self.pair_created_at,
+        }
 
 
 def utc_now() -> datetime:
@@ -172,13 +239,24 @@ def split_text(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
-async def send_long(event: events.NewMessage.Event, text: str) -> None:
+async def send_event_message(event: Any, text: str, **kwargs: Any) -> Any:
+    """Send a message from either a NewMessage or CallbackQuery event."""
+    if isinstance(event, events.CallbackQuery.Event):
+        return await event.respond(text, **kwargs)
+    return await event.reply(text, **kwargs)
+
+
+async def send_long(event: Any, text: str) -> None:
     for chunk in split_text(text):
-        await event.reply(chunk, link_preview=False)
+        await send_event_message(
+            event,
+            chunk,
+            link_preview=False,
+        )
         await asyncio.sleep(0.4)
 
 
-def authorized(event: events.NewMessage.Event) -> bool:
+def authorized(event: Any) -> bool:
     return ALLOWED_CHAT_ID is None or event.chat_id == ALLOWED_CHAT_ID
 
 
@@ -214,6 +292,276 @@ def build_http_session() -> requests.Session:
 HTTP = build_http_session()
 
 
+
+
+# =========================================================
+# DISCOVERY CONFIGURATION / NORMALIZATION
+# =========================================================
+
+ALTCOIN_SECTORS: dict[str, str] = {
+    "all": "All Altcoins",
+    "ai": "Artificial Intelligence",
+    "artificial-intelligence": "Artificial Intelligence",
+    "gamefi": "GameFi",
+    "gaming": "GameFi",
+    "defi": "DeFi",
+    "depin": "DePIN",
+    "rwa": "Real World Assets",
+    "real-world-assets": "Real World Assets",
+    "layer1": "Layer 1",
+    "layer-1": "Layer 1",
+    "layer2": "Layer 2",
+    "layer-2": "Layer 2",
+    "infrastructure": "Infrastructure",
+    "privacy": "Privacy",
+    "interoperability": "Interoperability",
+    "nft": "NFT",
+    "dex": "DEX",
+    "stablecoin": "Stablecoin",
+}
+
+# Project Hunter labels mapped to CoinGecko category IDs.
+COINGECKO_SECTOR_IDS: dict[str, str] = {
+    "ai": "artificial-intelligence",
+    "artificial-intelligence": "artificial-intelligence",
+    "gamefi": "gaming",
+    "gaming": "gaming",
+    "defi": "decentralized-finance-defi",
+    "depin": "depin",
+    "rwa": "real-world-assets-rwa",
+    "real-world-assets": "real-world-assets-rwa",
+    "layer1": "layer-1",
+    "layer-1": "layer-1",
+    "layer2": "layer-2",
+    "layer-2": "layer-2",
+    "privacy": "privacy-coins",
+    "interoperability": "interoperability",
+    "nft": "non-fungible-tokens-nft",
+    "dex": "decentralized-exchange",
+    "stablecoin": "stablecoins",
+}
+
+ALT_SOURCES = {"all", "coingecko", "mobula", "dex", "dexscreener"}
+MEME_SOURCES = {"all", "birdeye", "mobula", "dex", "dexscreener"}
+MEME_LAUNCHPADS = {
+    "all": "all",
+    "pumpfun": "pump_dot_fun",
+    "pump.fun": "pump_dot_fun",
+    "pump_dot_fun": "pump_dot_fun",
+    "fourmeme": "four.meme",
+    "four.meme": "four.meme",
+    "moonshot": "moonshot",
+    "raydium": "raydium_launchlab",
+    "raydium-launchlab": "raydium_launchlab",
+    "meteora": "meteora_dynamic_bonding_curve",
+    "nadfun": "nad.fun",
+    "nad.fun": "nad.fun",
+}
+
+MOBULA_POOL_TYPES = {
+    "pumpfun": "pumpfun",
+    "pump.fun": "pumpfun",
+    "pump_dot_fun": "pumpfun",
+    "moonshot": "moonshot",
+}
+
+CHAIN_ALIASES = {
+    "sol": "solana",
+    "solana": "solana",
+    "bsc": "bsc",
+    "bnb": "bsc",
+    "binance-smart-chain": "bsc",
+    "eth": "ethereum",
+    "ethereum": "ethereum",
+    "base": "base",
+    "monad": "monad",
+}
+
+MOBULA_CHAIN_IDS = {
+    "solana": "solana:solana",
+    "ethereum": "evm:1",
+    "bsc": "evm:56",
+    "base": "evm:8453",
+}
+
+def clean_source_name(value: str) -> str:
+    value = (value or "").strip().lower()
+    return "dex" if value == "dexscreener" else value
+
+
+def normalize_chain(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return CHAIN_ALIASES.get(text, text)
+
+
+def first_number(data: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def first_text(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def walk_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_dicts(child)
+
+
+def extract_items(payload: Any) -> list[dict[str, Any]]:
+    """Tolerate provider response wrappers without depending on one schema revision."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("items", "list", "tokens", "results", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = extract_items(value)
+            if nested:
+                return nested
+
+    # Mobula Pulse nests token rows inside payload/views.
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in walk_dicts(payload):
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if (
+            ("address" in item or "contract" in item or "tokenAddress" in item)
+            and ("name" in item or "symbol" in item)
+        ):
+            candidates.append(item)
+    return candidates
+
+
+def extract_socials(value: Any) -> dict[str, str]:
+    result = {
+        "website": "",
+        "x_username": "",
+        "x_url": "",
+        "telegram_url": "",
+    }
+
+    url_pattern = re.compile(r"https?://[^\s\"'<>]+", re.I)
+
+    def consume_url(url: str, label: str = "") -> None:
+        if not url:
+            return
+        url = url.strip().rstrip(".,)")
+        lowered = url.lower()
+        label = label.lower()
+
+        if "t.me/" in lowered or "telegram.me/" in lowered:
+            if not result["telegram_url"]:
+                result["telegram_url"] = url
+            return
+
+        if "x.com/" in lowered or "twitter.com/" in lowered:
+            if not result["x_url"]:
+                result["x_url"] = url
+            username = url.rstrip("/").split("/")[-1].split("?")[0].lstrip("@")
+            if username and username not in {"home", "share", "intent"}:
+                result["x_username"] = username
+            return
+
+        if label in {"twitter", "x"} and not url.startswith("http"):
+            username = url.lstrip("@")
+            result["x_username"] = username
+            result["x_url"] = f"https://x.com/{username}"
+            return
+
+        if label in {"telegram", "tg"} and not url.startswith("http"):
+            result["telegram_url"] = f"https://t.me/{url.lstrip('@')}"
+            return
+
+        if not result["website"]:
+            result["website"] = url
+
+    for item in walk_dicts(value):
+        platform = first_text(item, "platform", "type", "label", "name")
+        direct_url = first_text(item, "url", "link", "value", "website")
+        if direct_url:
+            consume_url(direct_url, platform)
+
+        handle = first_text(item, "handle", "username")
+        if handle and platform.lower() in {"twitter", "x"}:
+            consume_url(handle, platform)
+        elif handle and platform.lower() in {"telegram", "tg"}:
+            consume_url(handle, platform)
+
+        for raw in item.values():
+            if isinstance(raw, str):
+                for url in url_pattern.findall(raw):
+                    consume_url(url)
+
+    return result
+
+
+def candidate_unique_id(
+    source: str,
+    chain: str,
+    contract_address: str,
+    fallback: str,
+) -> str:
+    chain = normalize_chain(chain)
+    contract_address = (contract_address or "").strip()
+    if chain and contract_address:
+        return f"{chain}:{contract_address.lower()}"
+    return f"{source}:{fallback.strip().lower()}"
+
+
+def merge_candidate(primary: DiscoveryCandidate, incoming: DiscoveryCandidate) -> DiscoveryCandidate:
+    """Merge provider observations for the same contract without losing richer fields."""
+    source_set = {
+        part.strip()
+        for part in (primary.source + "," + incoming.source).split(",")
+        if part.strip()
+    }
+    primary.source = ",".join(sorted(source_set))
+
+    for attr in (
+        "name", "symbol", "chain", "contract_address", "launchpad",
+        "website", "x_username", "x_url", "telegram_url", "external_url",
+    ):
+        if not getattr(primary, attr) and getattr(incoming, attr):
+            setattr(primary, attr, getattr(incoming, attr))
+
+    primary.market_cap = max(primary.market_cap, incoming.market_cap)
+    primary.liquidity = max(primary.liquidity, incoming.liquidity)
+    primary.volume_24h = max(primary.volume_24h, incoming.volume_24h)
+
+    if not primary.pair_created_at and incoming.pair_created_at:
+        primary.pair_created_at = incoming.pair_created_at
+
+    return primary
+
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -246,6 +594,17 @@ class Storage:
                     symbol TEXT,
                     market_cap INTEGER,
                     category TEXT,
+                    sector TEXT,
+                    source TEXT,
+                    sources TEXT,
+                    asset_type TEXT DEFAULT 'alt',
+                    chain TEXT,
+                    contract_address TEXT,
+                    launchpad TEXT,
+                    liquidity REAL DEFAULT 0,
+                    volume_24h REAL DEFAULT 0,
+                    external_url TEXT,
+                    pair_created_at INTEGER,
                     website TEXT,
                     x_username TEXT,
                     x_url TEXT,
@@ -294,6 +653,17 @@ class Storage:
 
         required_columns = {
             "category": "TEXT",
+            "sector": "TEXT",
+            "source": "TEXT",
+            "sources": "TEXT",
+            "asset_type": "TEXT DEFAULT 'alt'",
+            "chain": "TEXT",
+            "contract_address": "TEXT",
+            "launchpad": "TEXT",
+            "liquidity": "REAL DEFAULT 0",
+            "volume_24h": "REAL DEFAULT 0",
+            "external_url": "TEXT",
+            "pair_created_at": "INTEGER",
             "website": "TEXT",
             "x_username": "TEXT",
             "x_url": "TEXT",
@@ -360,6 +730,31 @@ class Storage:
                 (utc_now().isoformat(),),
             )
 
+            connection.execute(
+                """
+                UPDATE projects
+                SET asset_type = COALESCE(NULLIF(asset_type, ''), 'alt'),
+                    sector = COALESCE(NULLIF(sector, ''), category, 'all'),
+                    source = COALESCE(NULLIF(source, ''), 'coingecko'),
+                    sources = COALESCE(NULLIF(sources, ''), source, 'coingecko'),
+                    liquidity = COALESCE(liquidity, 0),
+                    volume_24h = COALESCE(volume_24h, 0)
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_projects_contract
+                ON projects(chain, contract_address)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_projects_type_sector
+                ON projects(asset_type, sector)
+                """
+            )
+
             connection.commit()
 
     def exists(self, coin_id: str) -> bool:
@@ -370,9 +765,94 @@ class Storage:
             ).fetchone()
         return row is not None
 
-    def save_pending(self, project: dict[str, Any]) -> None:
+    def find_by_contract(
+        self,
+        chain: str,
+        contract_address: str,
+    ) -> Optional[dict[str, Any]]:
+        if not chain or not contract_address:
+            return None
+
         with self.connect() as connection:
-            connection.execute(
+            row = connection.execute(
+                """
+                SELECT *
+                FROM projects
+                WHERE LOWER(chain) = LOWER(?)
+                  AND LOWER(contract_address) = LOWER(?)
+                LIMIT 1
+                """,
+                (chain, contract_address),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def candidate_exists(self, project: dict[str, Any]) -> bool:
+        if self.exists(project["coin_id"]):
+            return True
+
+        return self.find_by_contract(
+            project.get("chain") or "",
+            project.get("contract_address") or "",
+        ) is not None
+
+    def save_pending(self, project: dict[str, Any]) -> bool:
+        """Insert a new candidate or merge another provider into an existing contract."""
+        existing = self.find_by_contract(
+            project.get("chain") or "",
+            project.get("contract_address") or "",
+        )
+
+        if existing:
+            existing_sources = {
+                item.strip()
+                for item in str(existing.get("sources") or existing.get("source") or "").split(",")
+                if item.strip()
+            }
+            incoming_sources = {
+                item.strip()
+                for item in str(project.get("sources") or project.get("source") or "").split(",")
+                if item.strip()
+            }
+            merged_sources = ",".join(sorted(existing_sources | incoming_sources))
+
+            with self.connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET sources = ?,
+                        source = COALESCE(NULLIF(source, ''), ?),
+                        website = COALESCE(NULLIF(website, ''), ?),
+                        x_username = COALESCE(NULLIF(x_username, ''), ?),
+                        x_url = COALESCE(NULLIF(x_url, ''), ?),
+                        telegram_url = COALESCE(NULLIF(telegram_url, ''), ?),
+                        market_cap = MAX(COALESCE(market_cap, 0), ?),
+                        liquidity = MAX(COALESCE(liquidity, 0), ?),
+                        volume_24h = MAX(COALESCE(volume_24h, 0), ?),
+                        launchpad = COALESCE(NULLIF(launchpad, ''), ?),
+                        external_url = COALESCE(NULLIF(external_url, ''), ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        merged_sources,
+                        project.get("source"),
+                        project.get("website"),
+                        project.get("x_username"),
+                        project.get("x_url"),
+                        project.get("telegram_url"),
+                        int(project.get("market_cap") or 0),
+                        float(project.get("liquidity") or 0),
+                        float(project.get("volume_24h") or 0),
+                        project.get("launchpad"),
+                        project.get("external_url"),
+                        existing["id"],
+                    ),
+                )
+                connection.commit()
+            return False
+
+        with self.connect() as connection:
+            cursor = connection.execute(
                 """
                 INSERT INTO projects (
                     coin_id,
@@ -380,6 +860,17 @@ class Storage:
                     symbol,
                     market_cap,
                     category,
+                    sector,
+                    source,
+                    sources,
+                    asset_type,
+                    chain,
+                    contract_address,
+                    launchpad,
+                    liquidity,
+                    volume_24h,
+                    external_url,
+                    pair_created_at,
                     website,
                     x_username,
                     x_url,
@@ -387,23 +878,38 @@ class Storage:
                     stage,
                     discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'pending', ?
+                )
                 ON CONFLICT(coin_id) DO NOTHING
                 """,
                 (
                     project["coin_id"],
                     project["name"],
                     project["symbol"],
-                    project["market_cap"],
-                    project["category"],
+                    int(project.get("market_cap") or 0),
+                    project.get("category") or "all",
+                    project.get("sector") or project.get("category") or "all",
+                    project.get("source") or "",
+                    project.get("sources") or project.get("source") or "",
+                    project.get("asset_type") or "alt",
+                    project.get("chain") or "",
+                    project.get("contract_address") or "",
+                    project.get("launchpad") or "",
+                    float(project.get("liquidity") or 0),
+                    float(project.get("volume_24h") or 0),
+                    project.get("external_url") or "",
+                    project.get("pair_created_at"),
                     project.get("website"),
-                    project["x_username"],
-                    project["x_url"],
-                    project["telegram_url"],
+                    project.get("x_username") or "",
+                    project.get("x_url") or "",
+                    project.get("telegram_url") or "",
                     utc_now().isoformat(),
                 ),
             )
             connection.commit()
+            return cursor.rowcount > 0
 
     def pending_projects(self, limit: int) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -673,6 +1179,707 @@ class CoinGeckoClient:
 
 
 COINGECKO = CoinGeckoClient()
+
+
+# =========================================================
+# MOBULA / BIRDEYE / DEX SCREENER DISCOVERY
+# =========================================================
+
+class MobulaClient:
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if MOBULA_API_KEY:
+            headers["Authorization"] = MOBULA_API_KEY
+        return headers
+
+    def trendings(self, blockchain: Optional[str] = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if blockchain and blockchain != "all":
+            params["blockchain"] = blockchain
+
+        response = HTTP.get(
+            f"{MOBULA_API_BASE}/1/metadata/trendings",
+            params=params,
+            headers=self.headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else extract_items(data)
+
+    def pulse(
+        self,
+        *,
+        chain: str = "solana",
+        launchpad: str = "all",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        params: list[tuple[str, Any]] = [
+            ("assetMode", "true"),
+            ("limit", max(1, min(limit, 100))),
+            ("excludeDuplicates", "true"),
+        ]
+
+        mobula_chain = MOBULA_CHAIN_IDS.get(normalize_chain(chain))
+        if mobula_chain:
+            params.append(("chainId", mobula_chain))
+
+        pool_type = MOBULA_POOL_TYPES.get(launchpad.lower())
+        if pool_type:
+            params.append(("poolTypes", pool_type))
+
+        response = HTTP.get(
+            f"{MOBULA_API_BASE}/2/pulse",
+            params=params,
+            headers=self.headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return extract_items(response.json())
+
+
+class BirdeyeClient:
+    @property
+    def headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "x-chain": MEME_DEFAULT_CHAIN,
+        }
+        if BIRDEYE_API_KEY:
+            headers["X-API-KEY"] = BIRDEYE_API_KEY
+        return headers
+
+    def meme_list(
+        self,
+        *,
+        chain: str,
+        launchpad: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        headers = dict(self.headers)
+        headers["x-chain"] = normalize_chain(chain)
+
+        params: dict[str, Any] = {
+            "sort_by": "volume_24h_usd",
+            "sort_type": "desc",
+            "limit": max(1, min(limit, 100)),
+            "offset": 0,
+            "min_market_cap": MEME_MIN_MARKET_CAP,
+            "max_market_cap": MEME_MAX_MARKET_CAP,
+            "min_liquidity": MEME_MIN_LIQUIDITY,
+            "min_volume_24h_usd": MEME_MIN_VOLUME_24H,
+        }
+
+        source_name = MEME_LAUNCHPADS.get(launchpad.lower(), launchpad.lower())
+        if source_name and source_name != "all":
+            params["source"] = source_name
+
+        response = HTTP.get(
+            f"{BIRDEYE_API_BASE}/defi/v3/token/meme/list",
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return extract_items(response.json())
+
+    def meme_detail(self, address: str, chain: str) -> dict[str, Any]:
+        headers = dict(self.headers)
+        headers["x-chain"] = normalize_chain(chain)
+
+        response = HTTP.get(
+            f"{BIRDEYE_API_BASE}/defi/v3/token/meme/detail/single",
+            params={"address": address},
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict):
+            inner = data.get("data")
+            return inner if isinstance(inner, dict) else data
+        return {}
+
+
+class DexScreenerClient:
+    def latest_profiles(self) -> list[dict[str, Any]]:
+        response = HTTP.get(
+            f"{DEXSCREENER_API_BASE}/token-profiles/latest/v1",
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def token_pairs(self, chain: str, address: str) -> list[dict[str, Any]]:
+        response = HTTP.get(
+            f"{DEXSCREENER_API_BASE}/token-pairs/v1/{chain}/{address}",
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def best_pair(self, chain: str, address: str) -> Optional[dict[str, Any]]:
+        pairs = self.token_pairs(chain, address)
+        if not pairs:
+            return None
+
+        return max(
+            pairs,
+            key=lambda pair: first_number(
+                pair.get("liquidity") or {},
+                "usd",
+            ),
+        )
+
+
+MOBULA = MobulaClient()
+BIRDEYE = BirdeyeClient()
+DEX = DexScreenerClient()
+
+
+def candidate_from_dex_pair(
+    pair: dict[str, Any],
+    *,
+    asset_type: str,
+    sector: str,
+    source: str = "dex",
+    launchpad: str = "",
+) -> Optional[DiscoveryCandidate]:
+    base = pair.get("baseToken") or {}
+    address = first_text(base, "address")
+    name = first_text(base, "name")
+    symbol = first_text(base, "symbol").upper()
+    chain = normalize_chain(first_text(pair, "chainId"))
+
+    if not address or not name or not symbol or not chain:
+        return None
+
+    info = pair.get("info") or {}
+    socials = extract_socials(info)
+
+    market_cap = int(first_number(pair, "marketCap", "fdv"))
+    liquidity = first_number(pair.get("liquidity") or {}, "usd")
+    volume_24h = first_number(pair.get("volume") or {}, "h24", "24h")
+
+    return DiscoveryCandidate(
+        unique_id=candidate_unique_id(source, chain, address, name),
+        name=name,
+        symbol=symbol,
+        market_cap=market_cap,
+        source=source,
+        asset_type=asset_type,
+        sector=sector,
+        chain=chain,
+        contract_address=address,
+        launchpad=launchpad or first_text(pair, "dexId"),
+        website=socials["website"] or None,
+        x_username=socials["x_username"],
+        x_url=socials["x_url"],
+        telegram_url=socials["telegram_url"],
+        external_url=first_text(pair, "url"),
+        liquidity=liquidity,
+        volume_24h=volume_24h,
+        pair_created_at=int(first_number(pair, "pairCreatedAt")) or None,
+        metadata={"provider": "dex"},
+    )
+
+
+def enrich_with_dex(candidate: DiscoveryCandidate) -> DiscoveryCandidate:
+    if not candidate.chain or not candidate.contract_address:
+        return candidate
+
+    try:
+        pair = DEX.best_pair(candidate.chain, candidate.contract_address)
+    except Exception as error:
+        LOGGER.warning(
+            "DEX Screener enrichment failed for %s:%s: %s",
+            candidate.chain,
+            candidate.contract_address,
+            error,
+        )
+        return candidate
+
+    if not pair:
+        return candidate
+
+    dex_candidate = candidate_from_dex_pair(
+        pair,
+        asset_type=candidate.asset_type,
+        sector=candidate.sector,
+        launchpad=candidate.launchpad,
+    )
+
+    if dex_candidate:
+        candidate = merge_candidate(candidate, dex_candidate)
+
+    return candidate
+
+
+def candidate_from_mobula(
+    item: dict[str, Any],
+    *,
+    asset_type: str,
+    sector: str,
+    launchpad: str = "",
+) -> Optional[DiscoveryCandidate]:
+    token = item.get("token") if isinstance(item.get("token"), dict) else item
+
+    address = first_text(
+        token,
+        "address",
+        "contract",
+        "contractAddress",
+        "tokenAddress",
+    )
+    name = first_text(token, "name", "tokenName")
+    symbol = first_text(token, "symbol", "tokenSymbol").upper()
+    chain = normalize_chain(
+        first_text(token, "blockchain", "chain", "chainId")
+    )
+
+    # Trendings use a contracts array.
+    contracts = token.get("contracts")
+    if isinstance(contracts, list) and contracts:
+        contract = contracts[0] if isinstance(contracts[0], dict) else {}
+        address = address or first_text(contract, "address")
+        chain = chain or normalize_chain(first_text(contract, "blockchain", "chain"))
+
+    if ":" in chain:
+        if chain == "solana:solana":
+            chain = "solana"
+        elif chain.startswith("evm:"):
+            evm_map = {"evm:1": "ethereum", "evm:56": "bsc", "evm:8453": "base"}
+            chain = evm_map.get(chain, chain)
+
+    if not name or not symbol:
+        return None
+
+    socials = extract_socials(item)
+
+    market_cap = int(first_number(
+        token,
+        "marketCap", "market_cap", "market_cap_usd", "fdv",
+    ))
+    liquidity = first_number(
+        token,
+        "liquidity", "liquidityUSD", "liquidity_usd", "liquidityMax",
+    )
+    volume_24h = first_number(
+        token,
+        "volume24h", "volume_24h", "volume24hUSD", "volume_24h_usd",
+    )
+    detected_launchpad = (
+        first_text(token, "source", "poolType", "pool_type")
+        or launchpad
+    )
+
+    fallback = address or f"{name}-{symbol}"
+    return DiscoveryCandidate(
+        unique_id=candidate_unique_id("mobula", chain, address, fallback),
+        name=name,
+        symbol=symbol,
+        market_cap=market_cap,
+        source="mobula",
+        asset_type=asset_type,
+        sector=sector,
+        chain=chain,
+        contract_address=address,
+        launchpad=detected_launchpad,
+        website=socials["website"] or None,
+        x_username=socials["x_username"],
+        x_url=socials["x_url"],
+        telegram_url=socials["telegram_url"],
+        liquidity=liquidity,
+        volume_24h=volume_24h,
+        metadata={"provider": "mobula"},
+    )
+
+
+def candidate_from_birdeye(
+    item: dict[str, Any],
+    *,
+    chain: str,
+    launchpad: str,
+) -> Optional[DiscoveryCandidate]:
+    address = first_text(
+        item,
+        "address", "token_address", "tokenAddress", "mint",
+    )
+    name = first_text(item, "name", "token_name", "tokenName")
+    symbol = first_text(item, "symbol", "token_symbol", "tokenSymbol").upper()
+
+    if not address or not name or not symbol:
+        return None
+
+    socials = extract_socials(item)
+
+    return DiscoveryCandidate(
+        unique_id=candidate_unique_id("birdeye", chain, address, name),
+        name=name,
+        symbol=symbol,
+        market_cap=int(first_number(
+            item,
+            "market_cap", "marketCap", "marketcap", "fdv",
+        )),
+        source="birdeye",
+        asset_type="meme",
+        sector="memecoin",
+        chain=normalize_chain(chain),
+        contract_address=address,
+        launchpad=first_text(item, "source", "launchpad") or launchpad,
+        website=socials["website"] or None,
+        x_username=socials["x_username"],
+        x_url=socials["x_url"],
+        telegram_url=socials["telegram_url"],
+        liquidity=first_number(item, "liquidity", "liquidity_usd"),
+        volume_24h=first_number(
+            item,
+            "volume_24h_usd", "volume24h", "volume_24h",
+        ),
+        metadata={"provider": "birdeye"},
+    )
+
+
+async def discover_coingecko(params: FastScanParams) -> list[DiscoveryCandidate]:
+    candidates: list[DiscoveryCandidate] = []
+    inspected = 0
+
+    for page in range(1, MAX_PAGES_PER_FAST_SCAN + 1):
+        market_page = await asyncio.to_thread(
+            COINGECKO.market_page,
+            page,
+            params.category_id,
+            params.sort_mode,
+        )
+
+        if not market_page:
+            break
+
+        for coin in market_page:
+            if inspected >= FAST_SCAN_MAX_INSPECTED:
+                break
+            inspected += 1
+
+            market_cap = int(coin.get("market_cap") or 0)
+            if market_cap < MIN_MARKET_CAP or market_cap > MAX_MARKET_CAP:
+                continue
+
+            coin_id = coin.get("id")
+            if not coin_id or STORAGE.exists(str(coin_id)):
+                continue
+
+            try:
+                details = await asyncio.to_thread(COINGECKO.details, coin_id)
+            except Exception as error:
+                LOGGER.warning("CoinGecko details failed for %s: %s", coin_id, error)
+                continue
+
+            links = details.get("links") or {}
+            x_username = str(links.get("twitter_screen_name") or "").strip().lstrip("@")
+            telegram_url = COINGECKO.telegram_url(
+                links.get("telegram_channel_identifier")
+            )
+            website = COINGECKO.website_url(links.get("homepage"))
+
+            platforms = details.get("platforms") or {}
+            chain = ""
+            address = ""
+            if isinstance(platforms, dict):
+                for raw_chain, raw_address in platforms.items():
+                    if raw_address:
+                        chain = normalize_chain(raw_chain)
+                        address = str(raw_address).strip()
+                        break
+
+            candidate = DiscoveryCandidate(
+                unique_id=str(coin_id),
+                name=str(coin.get("name") or ""),
+                symbol=str(coin.get("symbol") or "").upper(),
+                market_cap=market_cap,
+                source="coingecko",
+                asset_type="alt",
+                sector=params.sector,
+                chain=chain,
+                contract_address=address,
+                website=website,
+                x_username=x_username,
+                x_url=f"https://x.com/{x_username}" if x_username else "",
+                telegram_url=telegram_url or "",
+                external_url=f"https://www.coingecko.com/en/coins/{coin_id}",
+                metadata={"provider": "coingecko"},
+            )
+
+            if address and chain:
+                candidate = await asyncio.to_thread(enrich_with_dex, candidate)
+
+            candidates.append(candidate)
+            if len(candidates) >= params.target_count:
+                return candidates
+
+        if inspected >= FAST_SCAN_MAX_INSPECTED:
+            break
+
+    return candidates
+
+
+async def discover_mobula(params: FastScanParams) -> list[DiscoveryCandidate]:
+    if not MOBULA_API_KEY:
+        LOGGER.warning("Mobula source requested but MOBULA_API_KEY is missing.")
+        return []
+
+    if params.asset_type == "meme":
+        chain = MEME_DEFAULT_CHAIN if params.chain == "all" else params.chain
+        items = await asyncio.to_thread(
+            MOBULA.pulse,
+            chain=chain,
+            launchpad=params.launchpad,
+            limit=min(max(params.target_count * 2, 30), 100),
+        )
+        asset_type = "meme"
+        sector = "memecoin"
+    else:
+        blockchain = None if params.chain == "all" else params.chain
+        items = await asyncio.to_thread(MOBULA.trendings, blockchain)
+        asset_type = "alt"
+        sector = params.sector
+
+    candidates: list[DiscoveryCandidate] = []
+
+    for item in items:
+        candidate = candidate_from_mobula(
+            item,
+            asset_type=asset_type,
+            sector=sector,
+            launchpad=params.launchpad,
+        )
+        if not candidate:
+            continue
+
+        candidate = await asyncio.to_thread(enrich_with_dex, candidate)
+
+        if asset_type == "meme":
+            if candidate.market_cap and not (
+                MEME_MIN_MARKET_CAP <= candidate.market_cap <= MEME_MAX_MARKET_CAP
+            ):
+                continue
+            if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
+                continue
+
+        candidates.append(candidate)
+        if len(candidates) >= params.target_count:
+            break
+
+    return candidates
+
+
+async def discover_birdeye(params: FastScanParams) -> list[DiscoveryCandidate]:
+    if not BIRDEYE_API_KEY:
+        LOGGER.warning("Birdeye source requested but BIRDEYE_API_KEY is missing.")
+        return []
+
+    chain = MEME_DEFAULT_CHAIN if params.chain == "all" else params.chain
+
+    if chain not in {"solana", "bsc", "monad"}:
+        LOGGER.warning("Birdeye meme list does not support chain=%s", chain)
+        return []
+
+    items = await asyncio.to_thread(
+        BIRDEYE.meme_list,
+        chain=chain,
+        launchpad=params.launchpad,
+        limit=min(max(params.target_count * 2, 30), 100),
+    )
+
+    candidates: list[DiscoveryCandidate] = []
+
+    for item in items:
+        candidate = candidate_from_birdeye(
+            item,
+            chain=chain,
+            launchpad=params.launchpad,
+        )
+        if not candidate:
+            continue
+
+        # The list is intentionally cheap; detail is fetched only when socials
+        # are missing and the candidate survives the market filters.
+        if not candidate.x_username or not candidate.telegram_url:
+            try:
+                detail = await asyncio.to_thread(
+                    BIRDEYE.meme_detail,
+                    candidate.contract_address,
+                    chain,
+                )
+                richer = candidate_from_birdeye(
+                    detail,
+                    chain=chain,
+                    launchpad=candidate.launchpad or params.launchpad,
+                )
+                if richer:
+                    candidate = merge_candidate(candidate, richer)
+            except Exception as error:
+                LOGGER.warning(
+                    "Birdeye detail failed for %s: %s",
+                    candidate.contract_address,
+                    error,
+                )
+
+        candidate = await asyncio.to_thread(enrich_with_dex, candidate)
+
+        candidates.append(candidate)
+        if len(candidates) >= params.target_count:
+            break
+
+    return candidates
+
+
+async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
+    profiles = await asyncio.to_thread(DEX.latest_profiles)
+    candidates: list[DiscoveryCandidate] = []
+
+    for profile in profiles:
+        chain = normalize_chain(first_text(profile, "chainId"))
+        address = first_text(profile, "tokenAddress")
+
+        if not chain or not address:
+            continue
+
+        if params.chain != "all" and chain != normalize_chain(params.chain):
+            continue
+
+        try:
+            pair = await asyncio.to_thread(DEX.best_pair, chain, address)
+        except Exception as error:
+            LOGGER.warning("DEX pair lookup failed for %s:%s: %s", chain, address, error)
+            continue
+
+        if not pair:
+            continue
+
+        candidate = candidate_from_dex_pair(
+            pair,
+            asset_type=params.asset_type,
+            sector="memecoin" if params.asset_type == "meme" else params.sector,
+        )
+        if not candidate:
+            continue
+
+        if params.asset_type == "meme":
+            if candidate.market_cap and not (
+                MEME_MIN_MARKET_CAP <= candidate.market_cap <= MEME_MAX_MARKET_CAP
+            ):
+                continue
+            if candidate.liquidity < MEME_MIN_LIQUIDITY:
+                continue
+            if candidate.volume_24h < MEME_MIN_VOLUME_24H:
+                continue
+
+        candidates.append(candidate)
+        if len(candidates) >= params.target_count:
+            break
+
+    return candidates
+
+
+async def discover_candidates(params: FastScanParams) -> tuple[list[DiscoveryCandidate], list[str]]:
+    """Run selected providers, normalize results, and deduplicate by chain+contract."""
+    requested = clean_source_name(params.source)
+    warnings: list[str] = []
+    providers = []
+
+    if params.asset_type == "alt":
+        if params.sector != "all":
+            if requested == "all":
+                # CoinGecko provides the explicit category taxonomy. DEX still
+                # enriches the resulting CoinGecko contracts inside the provider.
+                available = ["coingecko"]
+                warnings.append(
+                    "Sector-specific altcoin scans use CoinGecko for discovery "
+                    "because Mobula/Dex do not expose the same category taxonomy."
+                )
+            elif requested != "coingecko":
+                available = []
+                warnings.append(
+                    f"{requested} cannot guarantee the requested altcoin sector. "
+                    "Use source=coingecko or source=all for sector scans."
+                )
+            else:
+                available = ["coingecko"]
+        else:
+            available = ["coingecko", "mobula", "dex"] if requested == "all" else [requested]
+    else:
+        if params.launchpad != "all":
+            if requested == "all":
+                available = ["birdeye"]
+                if params.launchpad in MOBULA_POOL_TYPES:
+                    available.append("mobula")
+            elif requested == "dex":
+                available = []
+                warnings.append(
+                    "DEX Screener cannot reliably identify the original meme "
+                    "launchpad. Use Birdeye or Mobula for launchpad-specific scans."
+                )
+            elif requested == "mobula" and params.launchpad not in MOBULA_POOL_TYPES:
+                available = []
+                warnings.append(
+                    f"Mobula launchpad mapping is not configured for {params.launchpad}. "
+                    "Use Birdeye for this launchpad."
+                )
+            else:
+                available = [requested]
+        else:
+            available = ["birdeye", "mobula", "dex"] if requested == "all" else [requested]
+
+    for source in available:
+        if source == "coingecko" and params.asset_type == "alt":
+            providers.append(("coingecko", discover_coingecko(params)))
+        elif source == "mobula":
+            providers.append(("mobula", discover_mobula(params)))
+        elif source == "birdeye" and params.asset_type == "meme":
+            providers.append(("birdeye", discover_birdeye(params)))
+        elif source == "dex":
+            providers.append(("dex", discover_dex(params)))
+        else:
+            warnings.append(f"Source '{source}' is not valid for {params.asset_type} scans.")
+
+    merged: dict[str, DiscoveryCandidate] = {}
+
+    for source_name, coroutine in providers:
+        try:
+            rows = await coroutine
+        except Exception as error:
+            LOGGER.exception("%s discovery failed", source_name)
+            warnings.append(f"{source_name}: {type(error).__name__}: {error}")
+            continue
+
+        for candidate in rows:
+            contract_key = (
+                f"{candidate.chain}:{candidate.contract_address.lower()}"
+                if candidate.chain and candidate.contract_address
+                else candidate.unique_id
+            )
+
+            if contract_key in merged:
+                merged[contract_key] = merge_candidate(merged[contract_key], candidate)
+            else:
+                merged[contract_key] = candidate
+
+    # Favor candidates that already have actionable contact/social data.
+    ordered = sorted(
+        merged.values(),
+        key=lambda c: (
+            bool(c.x_username and c.telegram_url),
+            c.volume_24h,
+            c.liquidity,
+            c.market_cap,
+        ),
+        reverse=True,
+    )
+
+    return ordered[: params.target_count], warnings
 
 
 # =========================================================
@@ -961,209 +2168,151 @@ async def analyze_telegram(telegram_url: str) -> dict[str, Any]:
 # =========================================================
 
 async def run_fast_scan(
-    event: events.NewMessage.Event,
+    event: Any,
     params: FastScanParams,
 ) -> None:
     chat_id = event.chat_id
 
     if active_jobs:
-        await event.reply(
-            "A job is already running. Wait for it to finish."
+        await send_event_message(
+            event,
+            "A job is already running. Wait for it to finish.",
         )
         return
 
     active_jobs.add(chat_id)
+
+    scan_label = (
+        f"{params.asset_type}:{params.sector}:{params.source}"
+        if params.asset_type == "alt"
+        else f"meme:{params.launchpad}:{params.source}:{params.chain}"
+    )
+
     history_id = STORAGE.create_history(
-        "fast_scan",
+        f"fast_scan:{scan_label}",
         params.target_count,
     )
 
-    progress = await event.reply(
+    progress = await send_event_message(
+        event,
         (
-            "⚡ Fast scan started\n\n"
-            f"Target candidates: {params.target_count}\n"
-            f"Maximum inspected: {FAST_SCAN_MAX_INSPECTED}"
+            "⚡ Project Hunter scan started\n\n"
+            f"Type: {params.asset_type.upper()}\n"
+            f"Sector: {params.sector}\n"
+            f"Source: {params.source}\n"
+            + (
+                f"Launchpad: {params.launchpad}\n"
+                f"Chain: {params.chain}\n"
+                if params.asset_type == "meme"
+                else ""
+            )
+            + f"Target: {params.target_count}"
         )
     )
 
     inspected = 0
-    found_count = 0
+    inserted_count = 0
+    merged_count = 0
+    skipped_socials = 0
     preview_blocks: list[str] = []
 
     try:
-        for page in range(
-            1,
-            MAX_PAGES_PER_FAST_SCAN + 1,
-        ):
-            market_page = await asyncio.to_thread(
-                COINGECKO.market_page,
-                page,
-                params.category_id,
-                params.sort_mode,
-            )
+        candidates, warnings = await discover_candidates(params)
+        inspected = len(candidates)
 
-            if not market_page:
-                break
+        for number, candidate in enumerate(candidates, start=1):
+            # Preserve the current deep-analysis contract:
+            # only candidates with both X and Telegram enter pending analysis.
+            if not candidate.x_username or not candidate.telegram_url:
+                skipped_socials += 1
+                continue
 
-            for coin in market_page:
-                if inspected >= FAST_SCAN_MAX_INSPECTED:
-                    break
+            project = candidate.to_project()
+            is_new = STORAGE.save_pending(project)
 
-                inspected += 1
-
-                market_cap = int(
-                    coin.get("market_cap") or 0
-                )
-
-                if (
-                    market_cap < MIN_MARKET_CAP
-                    or market_cap > MAX_MARKET_CAP
-                ):
-                    continue
-
-                coin_id = coin.get("id")
-
-                if (
-                    not coin_id
-                    or STORAGE.exists(coin_id)
-                ):
-                    continue
-
-                details = None
-
-                try:
-                    details = await asyncio.to_thread(
-                        COINGECKO.details,
-                        coin_id,
-                    )
-                except Exception as error:
-                    LOGGER.warning(
-                        "CoinGecko details failed for %s: %s",
-                        coin_id,
-                        error,
-                    )
-                    continue
-
-                links = details.get("links") or {}
-
-                x_username = str(
-                    links.get("twitter_screen_name") or ""
-                ).strip().lstrip("@")
-
-                telegram_url = (
-                    COINGECKO.telegram_url(
-                        links.get(
-                            "telegram_channel_identifier"
-                        )
-                    )
-                )
-
-                if not x_username or not telegram_url:
-                    details = None
-                    continue
-
-                website = COINGECKO.website_url(
-                    links.get("homepage")
-                )
-
-                project = {
-                    "coin_id": coin_id,
-                    "name": str(
-                        coin.get("name") or ""
-                    ),
-                    "symbol": str(
-                        coin.get("symbol") or ""
-                    ).upper(),
-                    "market_cap": market_cap,
-                    "category": (
-                        params.category_name or "All"
-                    ),
-                    "website": website,
-                    "x_username": x_username,
-                    "x_url": (
-                        f"https://x.com/{x_username}"
-                    ),
-                    "telegram_url": telegram_url,
-                }
-
-                STORAGE.save_pending(project)
-                found_count += 1
-
-                # Keep only small strings for the final preview instead
-                # of retaining full CoinGecko project dictionaries.
+            if is_new:
+                inserted_count += 1
                 preview_blocks.append(
                     (
-                        f"{found_count}.\n"
-                        f"Project: {project['name']} "
-                        f"(${project['symbol']})\n"
-                        f"Market cap: "
-                        f"${project['market_cap']:,}\n"
-                        f"X: {project['x_url']}\n"
+                        f"{inserted_count}.\n"
+                        f"Project: {project['name']} (${project['symbol']})\n"
+                        f"Type: {project['asset_type']}\n"
+                        f"Sector: {project['sector']}\n"
+                        f"Source(s): {project['sources']}\n"
+                        + (
+                            f"Chain: {project['chain']}\n"
+                            if project.get("chain")
+                            else ""
+                        )
+                        + (
+                            f"Launchpad: {project['launchpad']}\n"
+                            if project.get("launchpad")
+                            else ""
+                        )
+                        + f"Market cap: ${project['market_cap']:,}\n"
+                        + (
+                            f"Liquidity: ${project['liquidity']:,.0f}\n"
+                            if project.get("liquidity")
+                            else ""
+                        )
+                        + (
+                            f"24h volume: ${project['volume_24h']:,.0f}\n"
+                            if project.get("volume_24h")
+                            else ""
+                        )
+                        + f"X: {project['x_url']}\n"
                         f"TG: {project['telegram_url']}"
                     )
                 )
+            else:
+                merged_count += 1
 
-                await progress.edit(
-                    (
-                        "⚡ Fast scan running\n\n"
-                        f"Inspected: {inspected}/"
-                        f"{FAST_SCAN_MAX_INSPECTED}\n"
-                        f"Candidates found: "
-                        f"{found_count}/"
-                        f"{params.target_count}\n"
-                        f"Current: {project['name']}"
-                    )
+            await progress.edit(
+                (
+                    "⚡ Project Hunter scan running\n\n"
+                    f"Candidates processed: {number}/{len(candidates)}\n"
+                    f"New saved: {inserted_count}\n"
+                    f"Merged/known: {merged_count}\n"
+                    f"Missing required socials: {skipped_socials}\n"
+                    f"Current: {candidate.name}"
                 )
+            )
 
-                project = None
-                details = None
-                links = None
-
-                if (
-                    GC_EVERY_N_PROJECTS > 0
-                    and found_count
-                    % GC_EVERY_N_PROJECTS
-                    == 0
-                ):
-                    gc.collect()
-
-                if found_count >= params.target_count:
-                    break
-
-                await asyncio.sleep(0.25)
-
-            # Drop the page response before loading another one.
-            market_page = None
-            gc.collect()
-
-            if (
-                found_count >= params.target_count
-                or inspected
-                >= FAST_SCAN_MAX_INSPECTED
-            ):
+            if inserted_count >= params.target_count:
                 break
+
+            if GC_EVERY_N_PROJECTS > 0 and number % GC_EVERY_N_PROJECTS == 0:
+                gc.collect()
+
+            await asyncio.sleep(0.15)
 
         STORAGE.finish_history(
             history_id,
             inspected=inspected,
-            found=found_count,
+            found=inserted_count,
             status="completed",
         )
 
+        warning_text = ""
+        if warnings:
+            warning_text = "\n\nNotes:\n" + "\n".join(f"• {w}" for w in warnings[:5])
+
         await progress.edit(
             (
-                "✅ Fast scan completed\n\n"
-                f"Inspected: {inspected}\n"
-                f"Candidates saved: {found_count}\n\n"
+                "✅ Scan completed\n\n"
+                f"Normalized candidates: {inspected}\n"
+                f"New candidates saved: {inserted_count}\n"
+                f"Known/merged: {merged_count}\n"
+                f"Missing X or Telegram: {skipped_socials}\n\n"
                 "Run /analyze to perform the deep checks."
+                + warning_text
             )
         )
 
         if preview_blocks:
             await send_long(
                 event,
-                "NEW CANDIDATES\n\n"
-                + "\n\n".join(preview_blocks),
+                "NEW CANDIDATES\n\n" + "\n\n".join(preview_blocks),
             )
 
     except Exception as error:
@@ -1172,14 +2321,14 @@ async def run_fast_scan(
         STORAGE.finish_history(
             history_id,
             inspected=inspected,
-            found=found_count,
+            found=inserted_count,
             status="failed",
             error_message=str(error),
         )
 
         await progress.edit(
             (
-                "❌ Fast scan failed\n\n"
+                "❌ Scan failed\n\n"
                 f"{type(error).__name__}: {error}"
             )
         )
@@ -1220,6 +2369,15 @@ async def analyze_one(
         "x_url": project["x_url"],
         "telegram_url": project["telegram_url"],
         "website": project.get("website"),
+        "source": project.get("source") or "",
+        "sources": project.get("sources") or project.get("source") or "",
+        "asset_type": project.get("asset_type") or "alt",
+        "sector": project.get("sector") or project.get("category") or "all",
+        "chain": project.get("chain") or "",
+        "contract_address": project.get("contract_address") or "",
+        "launchpad": project.get("launchpad") or "",
+        "liquidity": float(project.get("liquidity") or 0),
+        "volume_24h": float(project.get("volume_24h") or 0),
     }
 
     # -----------------------------------------------------
@@ -1535,6 +2693,9 @@ async def analyze_one(
 def format_analysis(result: dict[str, Any]) -> str:
     lines = [
         f"Project: {result['name']} (${result['symbol']})",
+        f"Type: {result.get('asset_type', 'alt')}",
+        f"Sector: {result.get('sector', 'all')}",
+        f"Source(s): {result.get('sources') or result.get('source') or 'unknown'}",
         f"Score: {result['score']}/100",
         f"Classification: {result['classification']}",
         f"Market cap: ${result['market_cap']:,}",
@@ -1798,25 +2959,118 @@ async def run_deep_analysis(
 # =========================================================
 
 def parse_fast_scan(text: str) -> FastScanParams:
+    """
+    Supported:
+      /scan
+      /scan 50
+      /scan 50 artificial-intelligence          (legacy)
+      /scan alt all all 50
+      /scan alt ai coingecko 50
+      /scan alt defi mobula 30
+      /scan meme all birdeye 50
+      /scan meme pumpfun all 50
+      /scan meme pumpfun mobula 30 solana
+      /scan all 50
+    """
     parts = text.strip().split()
-    target = 50
-    category = None
+    args = parts[1:]
 
-    if len(parts) >= 2:
-        target = int(parts[1])
+    if not args:
+        return FastScanParams()
 
-    if target < 1 or target > 100:
-        raise ValueError(
-            "Target must be between 1 and 100."
+    # Backwards compatibility: /scan 50 [coingecko-category]
+    if args[0].isdigit():
+        target = int(args[0])
+        if target < 1 or target > 100:
+            raise ValueError("Target must be between 1 and 100.")
+
+        category = args[1].lower() if len(args) >= 2 else None
+        return FastScanParams(
+            target_count=target,
+            asset_type="alt",
+            sector=category or "all",
+            source="coingecko",
+            category_id=category,
+            category_name=category,
         )
 
-    if len(parts) >= 3:
-        category = parts[2]
+    mode = args[0].lower()
 
-    return FastScanParams(
-        target_count=target,
-        category_id=category,
-        category_name=category,
+    if mode == "all":
+        target = int(args[1]) if len(args) >= 2 else 50
+        if target < 1 or target > 100:
+            raise ValueError("Target must be between 1 and 100.")
+        # "all" is intentionally split by the handler into alt + meme jobs.
+        return FastScanParams(
+            target_count=target,
+            asset_type="all",
+            sector="all",
+            source="all",
+        )
+
+    if mode in {"alt", "altcoin", "altcoins"}:
+        sector = args[1].lower() if len(args) >= 2 else "all"
+        source = clean_source_name(args[2]) if len(args) >= 3 else "all"
+        target = int(args[3]) if len(args) >= 4 else 50
+
+        if target < 1 or target > 100:
+            raise ValueError("Target must be between 1 and 100.")
+        if source not in ALT_SOURCES:
+            raise ValueError(
+                "Alt source must be: all, coingecko, mobula, or dex."
+            )
+
+        category_id = None
+        if sector != "all":
+            category_id = COINGECKO_SECTOR_IDS.get(sector, sector)
+
+        return FastScanParams(
+            target_count=target,
+            asset_type="alt",
+            sector=sector,
+            source=source,
+            category_id=category_id,
+            category_name=ALTCOIN_SECTORS.get(sector, sector),
+        )
+
+    if mode in {"meme", "memecoin", "memecoins"}:
+        launchpad = args[1].lower() if len(args) >= 2 else "all"
+        source = clean_source_name(args[2]) if len(args) >= 3 else "all"
+        target = int(args[3]) if len(args) >= 4 else 50
+
+        if len(args) >= 5:
+            chain = normalize_chain(args[4])
+        elif launchpad in {"fourmeme", "four.meme"}:
+            chain = "bsc"
+        elif launchpad in {"nadfun", "nad.fun"}:
+            chain = "monad"
+        else:
+            chain = MEME_DEFAULT_CHAIN
+
+        if target < 1 or target > 100:
+            raise ValueError("Target must be between 1 and 100.")
+        if source not in MEME_SOURCES:
+            raise ValueError(
+                "Meme source must be: all, birdeye, mobula, or dex."
+            )
+        if launchpad not in MEME_LAUNCHPADS:
+            raise ValueError(
+                "Launchpad must be: all, pumpfun, fourmeme, moonshot, "
+                "raydium, meteora, or nadfun."
+            )
+
+        return FastScanParams(
+            target_count=target,
+            asset_type="meme",
+            sector="memecoin",
+            source=source,
+            launchpad=launchpad,
+            chain=chain,
+        )
+
+    raise ValueError(
+        "Use /scan alt ..., /scan meme ..., /scan all, "
+        "or the legacy /scan 50 [category]."
     )
 
 
@@ -1846,6 +3100,9 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
         block = (
             f"Project: {row['name']} (${row['symbol']})\n"
             f"Stage: {row['stage']}\n"
+            f"Type: {row.get('asset_type') or 'alt'}\n"
+            f"Sector: {row.get('sector') or row.get('category') or 'all'}\n"
+            f"Source(s): {row.get('sources') or row.get('source') or 'unknown'}\n"
             f"Score: {row['score'] or 0}/100\n"
             f"Market cap: ${int(row['market_cap'] or 0):,}\n"
             f"X: {row['x_url']}\n"
@@ -1876,6 +3133,582 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+
+# =========================================================
+# INLINE SCAN UI
+# =========================================================
+
+def default_scan_ui_state() -> dict[str, Any]:
+    return {
+        "asset_type": None,
+        "sector": "all",
+        "launchpad": "all",
+        "source": "all",
+        "target_count": 50,
+        "chain": MEME_DEFAULT_CHAIN,
+        "page": "root",
+    }
+
+
+def get_scan_ui_state(chat_id: int) -> dict[str, Any]:
+    state = scan_ui_state.get(chat_id)
+    if state is None:
+        state = default_scan_ui_state()
+        scan_ui_state[chat_id] = state
+    return state
+
+
+def scan_root_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("💎 Altcoins", b"scan:type:alt"),
+            Button.inline("🐸 Memecoins", b"scan:type:meme"),
+        ],
+        [
+            Button.inline("🌐 Scan Everything", b"scan:type:all"),
+        ],
+        [
+            Button.inline("📊 Saved Projects", b"scan:saved"),
+            Button.inline("ℹ️ Sources", b"scan:sources"),
+        ],
+        [
+            Button.inline("❌ Close", b"scan:close"),
+        ],
+    ]
+
+
+def alt_sector_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("🤖 AI", b"scan:sector:ai"),
+            Button.inline("🎮 GameFi", b"scan:sector:gamefi"),
+        ],
+        [
+            Button.inline("💰 DeFi", b"scan:sector:defi"),
+            Button.inline("📡 DePIN", b"scan:sector:depin"),
+        ],
+        [
+            Button.inline("🪙 RWA", b"scan:sector:rwa"),
+            Button.inline("🏗 Layer 1", b"scan:sector:layer1"),
+        ],
+        [
+            Button.inline("🧱 Layer 2", b"scan:sector:layer2"),
+            Button.inline("⚡ Infrastructure", b"scan:sector:infrastructure"),
+        ],
+        [
+            Button.inline("🔐 Privacy", b"scan:sector:privacy"),
+            Button.inline("🔗 Interop", b"scan:sector:interoperability"),
+        ],
+        [
+            Button.inline("🖼 NFT", b"scan:sector:nft"),
+            Button.inline("💱 DEX", b"scan:sector:dex"),
+        ],
+        [
+            Button.inline("💵 Stablecoin", b"scan:sector:stablecoin"),
+            Button.inline("🌐 All Altcoins", b"scan:sector:all"),
+        ],
+        [
+            Button.inline("◀️ Back", b"scan:back:root"),
+        ],
+    ]
+
+
+def meme_launchpad_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("🚀 Pump.fun", b"scan:launchpad:pumpfun"),
+            Button.inline("🟣 Four.meme", b"scan:launchpad:fourmeme"),
+        ],
+        [
+            Button.inline("🌙 Moonshot", b"scan:launchpad:moonshot"),
+            Button.inline("🌊 Raydium", b"scan:launchpad:raydium"),
+        ],
+        [
+            Button.inline("🌋 Meteora", b"scan:launchpad:meteora"),
+            Button.inline("🟢 Nad.fun", b"scan:launchpad:nadfun"),
+        ],
+        [
+            Button.inline("🌐 All Launchpads", b"scan:launchpad:all"),
+        ],
+        [
+            Button.inline("◀️ Back", b"scan:back:root"),
+        ],
+    ]
+
+
+def source_keyboard(asset_type: str, sector_or_launchpad: str) -> list[list[Button]]:
+    if asset_type == "alt":
+        return [
+            [Button.inline("🌐 All Sources", b"scan:source:all")],
+            [
+                Button.inline("🦎 CoinGecko", b"scan:source:coingecko"),
+                Button.inline("📊 Mobula", b"scan:source:mobula"),
+            ],
+            [
+                Button.inline("📈 DEX Screener", b"scan:source:dex"),
+            ],
+            [
+                Button.inline("◀️ Back", b"scan:back:sector"),
+            ],
+        ]
+
+    buttons: list[list[Button]] = [
+        [Button.inline("🌐 All Sources", b"scan:source:all")],
+        [
+            Button.inline("👁 Birdeye", b"scan:source:birdeye"),
+            Button.inline("📊 Mobula", b"scan:source:mobula"),
+        ],
+        [
+            Button.inline("📈 DEX Screener", b"scan:source:dex"),
+        ],
+        [
+            Button.inline("◀️ Back", b"scan:back:launchpad"),
+        ],
+    ]
+
+    # DEX Screener does not reliably identify an original launchpad.
+    if sector_or_launchpad != "all":
+        buttons = [
+            [Button.inline("🌐 Best Available", b"scan:source:all")],
+            [
+                Button.inline("👁 Birdeye", b"scan:source:birdeye"),
+                Button.inline("📊 Mobula", b"scan:source:mobula"),
+            ],
+            [
+                Button.inline("◀️ Back", b"scan:back:launchpad"),
+            ],
+        ]
+
+    return buttons
+
+
+def count_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("10", b"scan:count:10"),
+            Button.inline("25", b"scan:count:25"),
+            Button.inline("50", b"scan:count:50"),
+        ],
+        [
+            Button.inline("75", b"scan:count:75"),
+            Button.inline("100", b"scan:count:100"),
+        ],
+        [
+            Button.inline("◀️ Back", b"scan:back:source"),
+        ],
+    ]
+
+
+def confirmation_keyboard() -> list[list[Button]]:
+    return [
+        [Button.inline("▶️ Start Scan", b"scan:start")],
+        [
+            Button.inline("🔢 Change Count", b"scan:back:count"),
+            Button.inline("🛠 Change Source", b"scan:back:source"),
+        ],
+        [
+            Button.inline("🏠 Main Menu", b"scan:back:root"),
+            Button.inline("❌ Cancel", b"scan:close"),
+        ],
+    ]
+
+
+def scan_summary_text(state: dict[str, Any]) -> str:
+    if state["asset_type"] == "all":
+        return (
+            "🌐 SCAN EVERYTHING\n\n"
+            f"Target: {state['target_count']} projects\n"
+            "Sources: All available\n"
+            "Altcoins + Memecoins"
+        )
+
+    if state["asset_type"] == "alt":
+        return (
+            "💎 ALTCOIN SCAN\n\n"
+            f"Sector: {state['sector']}\n"
+            f"Source: {state['source']}\n"
+            f"Target: {state['target_count']}"
+        )
+
+    return (
+        "🐸 MEMECOIN SCAN\n\n"
+        f"Launchpad: {state['launchpad']}\n"
+        f"Source: {state['source']}\n"
+        f"Chain: {state['chain']}\n"
+        f"Target: {state['target_count']}"
+    )
+
+
+async def show_scan_root(event: Any, *, edit: bool = False) -> None:
+    text = (
+        "🔎 PROJECT HUNTER\n\n"
+        "What do you want to hunt?"
+    )
+    buttons = scan_root_keyboard()
+
+    if edit and isinstance(event, events.CallbackQuery.Event):
+        await event.edit(text, buttons=buttons, link_preview=False)
+    else:
+        await send_event_message(
+            event,
+            text,
+            buttons=buttons,
+            link_preview=False,
+        )
+
+
+async def edit_scan_menu(
+    event: events.CallbackQuery.Event,
+    text: str,
+    buttons: list[list[Button]],
+) -> None:
+    await event.edit(
+        text,
+        buttons=buttons,
+        link_preview=False,
+    )
+
+
+def state_to_params(state: dict[str, Any]) -> FastScanParams:
+    if state["asset_type"] == "all":
+        return FastScanParams(
+            target_count=int(state["target_count"]),
+            asset_type="all",
+            sector="all",
+            source="all",
+        )
+
+    if state["asset_type"] == "alt":
+        sector = state["sector"]
+        return FastScanParams(
+            target_count=int(state["target_count"]),
+            asset_type="alt",
+            sector=sector,
+            source=state["source"],
+            category_id=(
+                None
+                if sector == "all"
+                else COINGECKO_SECTOR_IDS.get(sector, sector)
+            ),
+            category_name=ALTCOIN_SECTORS.get(sector, sector),
+        )
+
+    return FastScanParams(
+        target_count=int(state["target_count"]),
+        asset_type="meme",
+        sector="memecoin",
+        source=state["source"],
+        launchpad=state["launchpad"],
+        chain=state["chain"],
+    )
+
+
+@bot_client.on(events.CallbackQuery(pattern=rb"^scan:"))
+async def scan_menu_callback(event: events.CallbackQuery.Event) -> None:
+    if not authorized(event):
+        await event.answer("This bot is private.", alert=True)
+        return
+
+    chat_id = event.chat_id
+    state = get_scan_ui_state(chat_id)
+
+    try:
+        data = event.data.decode("utf-8")
+    except Exception:
+        await event.answer("Invalid menu action.", alert=True)
+        return
+
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    value = parts[2] if len(parts) > 2 else ""
+
+    await event.answer()
+
+    if action == "type":
+        state.clear()
+        state.update(default_scan_ui_state())
+        state["asset_type"] = value
+
+        if value == "alt":
+            state["page"] = "sector"
+            await edit_scan_menu(
+                event,
+                "💎 ALTCOINS\n\nChoose a sector:",
+                alt_sector_keyboard(),
+            )
+            return
+
+        if value == "meme":
+            state["page"] = "launchpad"
+            await edit_scan_menu(
+                event,
+                "🐸 MEMECOINS\n\nChoose a launchpad:",
+                meme_launchpad_keyboard(),
+            )
+            return
+
+        if value == "all":
+            state["source"] = "all"
+            state["page"] = "count"
+            await edit_scan_menu(
+                event,
+                "🌐 SCAN EVERYTHING\n\nHow many projects should Hunter target?",
+                count_keyboard(),
+            )
+            return
+
+    if action == "sector":
+        state["asset_type"] = "alt"
+        state["sector"] = value
+        state["page"] = "source"
+        await edit_scan_menu(
+            event,
+            (
+                "💎 ALTCOIN SCAN\n\n"
+                f"Sector: {value}\n\n"
+                "Choose a discovery source:"
+            ),
+            source_keyboard("alt", value),
+        )
+        return
+
+    if action == "launchpad":
+        state["asset_type"] = "meme"
+        state["launchpad"] = value
+
+        if value in {"fourmeme", "four.meme"}:
+            state["chain"] = "bsc"
+        elif value in {"nadfun", "nad.fun"}:
+            state["chain"] = "monad"
+        else:
+            state["chain"] = MEME_DEFAULT_CHAIN
+
+        state["page"] = "source"
+        await edit_scan_menu(
+            event,
+            (
+                "🐸 MEMECOIN SCAN\n\n"
+                f"Launchpad: {value}\n"
+                f"Chain: {state['chain']}\n\n"
+                "Choose a discovery source:"
+            ),
+            source_keyboard("meme", value),
+        )
+        return
+
+    if action == "source":
+        state["source"] = value
+        state["page"] = "count"
+        await edit_scan_menu(
+            event,
+            (
+                f"{scan_summary_text(state)}\n\n"
+                "How many projects should Hunter target?"
+            ),
+            count_keyboard(),
+        )
+        return
+
+    if action == "count":
+        state["target_count"] = int(value)
+        state["page"] = "confirm"
+        await edit_scan_menu(
+            event,
+            (
+                f"{scan_summary_text(state)}\n\n"
+                "Ready to start?"
+            ),
+            confirmation_keyboard(),
+        )
+        return
+
+    if action == "start":
+        if active_jobs:
+            await event.answer(
+                "A scan or analysis job is already running.",
+                alert=True,
+            )
+            return
+
+        params = state_to_params(state)
+
+        await event.edit(
+            (
+                f"{scan_summary_text(state)}\n\n"
+                "⏳ Starting..."
+            ),
+            buttons=None,
+            link_preview=False,
+        )
+
+        # Keep command behavior and UI behavior on the same backend.
+        if params.asset_type == "all":
+            async def run_everything_from_ui() -> None:
+                half = max(1, params.target_count // 2)
+
+                alt_params = FastScanParams(
+                    target_count=half,
+                    asset_type="alt",
+                    sector="all",
+                    source="all",
+                )
+                meme_params = FastScanParams(
+                    target_count=max(1, params.target_count - half),
+                    asset_type="meme",
+                    sector="memecoin",
+                    source="all",
+                    launchpad="all",
+                    chain=MEME_DEFAULT_CHAIN,
+                )
+
+                await run_fast_scan(event, alt_params)
+                await run_fast_scan(event, meme_params)
+
+            asyncio.create_task(run_everything_from_ui())
+        else:
+            asyncio.create_task(
+                run_fast_scan(event, params)
+            )
+        return
+
+    if action == "back":
+        if value == "root":
+            state.clear()
+            state.update(default_scan_ui_state())
+            await show_scan_root(event, edit=True)
+            return
+
+        if value == "sector":
+            state["page"] = "sector"
+            await edit_scan_menu(
+                event,
+                "💎 ALTCOINS\n\nChoose a sector:",
+                alt_sector_keyboard(),
+            )
+            return
+
+        if value == "launchpad":
+            state["page"] = "launchpad"
+            await edit_scan_menu(
+                event,
+                "🐸 MEMECOINS\n\nChoose a launchpad:",
+                meme_launchpad_keyboard(),
+            )
+            return
+
+        if value == "source":
+            state["page"] = "source"
+            if state["asset_type"] == "alt":
+                await edit_scan_menu(
+                    event,
+                    (
+                        "💎 ALTCOIN SCAN\n\n"
+                        f"Sector: {state['sector']}\n\n"
+                        "Choose a discovery source:"
+                    ),
+                    source_keyboard("alt", state["sector"]),
+                )
+            elif state["asset_type"] == "meme":
+                await edit_scan_menu(
+                    event,
+                    (
+                        "🐸 MEMECOIN SCAN\n\n"
+                        f"Launchpad: {state['launchpad']}\n"
+                        f"Chain: {state['chain']}\n\n"
+                        "Choose a discovery source:"
+                    ),
+                    source_keyboard("meme", state["launchpad"]),
+                )
+            else:
+                await edit_scan_menu(
+                    event,
+                    "🌐 SCAN EVERYTHING\n\nHow many projects should Hunter target?",
+                    count_keyboard(),
+                )
+            return
+
+        if value == "count":
+            state["page"] = "count"
+            await edit_scan_menu(
+                event,
+                (
+                    f"{scan_summary_text(state)}\n\n"
+                    "How many projects should Hunter target?"
+                ),
+                count_keyboard(),
+            )
+            return
+
+    if action == "sources":
+        await edit_scan_menu(
+            event,
+            (
+                "🛠 DISCOVERY SOURCES\n\n"
+                "Altcoins:\n"
+                "• CoinGecko\n"
+                "• Mobula\n"
+                "• DEX Screener\n\n"
+                "Memecoins:\n"
+                "• Birdeye\n"
+                "• Mobula\n"
+                "• DEX Screener"
+            ),
+            [[Button.inline("◀️ Back", b"scan:back:root")]],
+        )
+        return
+
+    if action == "saved":
+        counts = STORAGE.counts()
+        await edit_scan_menu(
+            event,
+            (
+                "📊 SAVED PROJECTS\n\n"
+                f"Total: {counts['total']}\n"
+                f"Pending: {counts['pending']}\n"
+                f"Priority: {counts['priority']}\n"
+                f"Qualified: {counts['qualified']}\n"
+                f"Watchlist: {counts['watchlist']}\n"
+                f"Rejected: {counts['rejected']}"
+            ),
+            [
+                [
+                    Button.inline("🔥 Priority", b"scan:list:priority"),
+                    Button.inline("✅ Qualified", b"scan:list:qualified"),
+                ],
+                [
+                    Button.inline("🟡 Watchlist", b"scan:list:watchlist"),
+                    Button.inline("⏳ Pending", b"scan:list:pending"),
+                ],
+                [Button.inline("◀️ Back", b"scan:back:root")],
+            ],
+        )
+        return
+
+    if action == "list":
+        stage = value
+        rows = STORAGE.list_projects(stage, 10)
+        await edit_scan_menu(
+            event,
+            f"{stage.upper()}\n\n{format_saved(rows)}",
+            [
+                [Button.inline("📊 Saved Projects", b"scan:saved")],
+                [Button.inline("🏠 Main Menu", b"scan:back:root")],
+            ],
+        )
+        return
+
+    if action == "close":
+        scan_ui_state.pop(chat_id, None)
+        await event.edit(
+            "❌ Scanner menu closed.",
+            buttons=None,
+            link_preview=False,
+        )
+        return
+
+    await event.answer("Unknown menu action.", alert=True)
+
+
 # =========================================================
 # BOT COMMANDS
 # =========================================================
@@ -1888,11 +3721,24 @@ async def start_handler(event: events.NewMessage.Event) -> None:
 
     await event.reply(
         (
-            "Project Hunter v2\n\n"
-            "Fast discovery:\n"
-            "/scan\n"
-            "/scan 50\n"
+            "Project Hunter v3 Multi-Source\n\n"
+            "Main scanner:\n"
+            "/scan — open the interactive menu\n\n"
+            "Altcoin discovery:\n"
+            "/scan alt all all 50\n"
+            "/scan alt ai coingecko 50\n"
+            "/scan alt defi mobula 30\n\n"
+            "Memecoin discovery:\n"
+            "/scan meme all all 50\n"
+            "/scan meme pumpfun birdeye 50\n"
+            "/scan meme pumpfun mobula 30 solana\n\n"
+            "Everything:\n"
+            "/scan all 50\n\n"
+            "Legacy syntax still works:\n"
             "/scan 50 artificial-intelligence\n\n"
+            "Discovery help:\n"
+            "/sources\n"
+            "/sectors\n\n"
             "Deep analysis:\n"
             "/analyze\n"
             "/analyze 20\n\n"
@@ -1915,14 +3761,89 @@ async def scan_handler(event: events.NewMessage.Event) -> None:
         await event.reply("This bot is private.")
         return
 
+    command_parts = event.raw_text.strip().split()
+
+    # /scan is now the primary button-driven interface.
+    if len(command_parts) == 1:
+        scan_ui_state[event.chat_id] = default_scan_ui_state()
+        await show_scan_root(event)
+        return
+
+    # Power-user / legacy commands remain available.
     try:
         params = parse_fast_scan(event.raw_text)
     except (ValueError, TypeError) as error:
         await event.reply(f"❌ {error}")
         return
 
-    asyncio.create_task(
-        run_fast_scan(event, params)
+    if params.asset_type == "all":
+        async def run_everything() -> None:
+            half = max(1, params.target_count // 2)
+
+            alt_params = FastScanParams(
+                target_count=half,
+                asset_type="alt",
+                sector="all",
+                source="all",
+            )
+            meme_params = FastScanParams(
+                target_count=max(1, params.target_count - half),
+                asset_type="meme",
+                sector="memecoin",
+                source="all",
+                launchpad="all",
+                chain=MEME_DEFAULT_CHAIN,
+            )
+
+            await run_fast_scan(event, alt_params)
+            await run_fast_scan(event, meme_params)
+
+        asyncio.create_task(run_everything())
+    else:
+        asyncio.create_task(run_fast_scan(event, params))
+
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/sources(?:@\w+)?$"))
+async def sources_handler(event: events.NewMessage.Event) -> None:
+    if not authorized(event):
+        return
+
+    await event.reply(
+        (
+            "DISCOVERY SOURCES\n\n"
+            "ALTCOINS\n"
+            "• coingecko — category/sector discovery\n"
+            "• mobula — on-chain/trending discovery\n"
+            "• dex — latest DEX profiles + market validation\n"
+            "• all — combine and deduplicate them\n\n"
+            "MEMECOINS\n"
+            "• birdeye — meme launchpad discovery\n"
+            "• mobula — Pulse/bonding discovery\n"
+            "• dex — latest DEX profiles + market validation\n"
+            "• all — combine and deduplicate them"
+        )
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/sectors(?:@\w+)?$"))
+async def sectors_handler(event: events.NewMessage.Event) -> None:
+    if not authorized(event):
+        return
+
+    sectors = [
+        "ai", "gamefi", "defi", "depin", "rwa", "layer1", "layer2",
+        "infrastructure", "privacy", "interoperability", "nft", "dex",
+        "stablecoin",
+    ]
+
+    await event.reply(
+        (
+            "ALTCOIN SECTORS\n\n"
+            + ", ".join(sectors)
+            + "\n\nMEME LAUNCHPADS\n\n"
+            + "all, pumpfun, fourmeme, moonshot, raydium, meteora, nadfun"
+        )
     )
 
 
@@ -2038,6 +3959,12 @@ async def main() -> None:
     LOGGER.info(
         "Project Hunter v2 connected as @%s",
         bot.username,
+    )
+    LOGGER.info(
+        "Discovery sources: coingecko=%s mobula=%s birdeye=%s dex=true",
+        bool(COINGECKO_API_KEY),
+        bool(MOBULA_API_KEY),
+        bool(BIRDEYE_API_KEY),
     )
     LOGGER.info(
         "Low-memory mode active: page_size=%s, "
