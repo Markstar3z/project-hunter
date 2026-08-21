@@ -1784,7 +1784,10 @@ async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
     return candidates
 
 
-async def discover_candidates(params: FastScanParams) -> tuple[list[DiscoveryCandidate], list[str]]:
+async def discover_candidates(
+    params: FastScanParams,
+    progress_callback: Optional[Any] = None,
+) -> tuple[list[DiscoveryCandidate], list[str]]:
     """Run selected providers, normalize results, and deduplicate by chain+contract."""
     requested = clean_source_name(params.source)
     warnings: list[str] = []
@@ -1847,12 +1850,31 @@ async def discover_candidates(params: FastScanParams) -> tuple[list[DiscoveryCan
 
     merged: dict[str, DiscoveryCandidate] = {}
 
-    for source_name, coroutine in providers:
+    total_providers = len(providers)
+
+    for provider_number, (source_name, coroutine) in enumerate(providers, start=1):
+        if progress_callback:
+            await progress_callback(
+                stage="discovering",
+                provider=source_name,
+                provider_number=provider_number,
+                provider_total=total_providers,
+                discovered=len(merged),
+            )
+
         try:
             rows = await coroutine
         except Exception as error:
             LOGGER.exception("%s discovery failed", source_name)
             warnings.append(f"{source_name}: {type(error).__name__}: {error}")
+            if progress_callback:
+                await progress_callback(
+                    stage="provider_failed",
+                    provider=source_name,
+                    provider_number=provider_number,
+                    provider_total=total_providers,
+                    discovered=len(merged),
+                )
             continue
 
         for candidate in rows:
@@ -1866,6 +1888,16 @@ async def discover_candidates(params: FastScanParams) -> tuple[list[DiscoveryCan
                 merged[contract_key] = merge_candidate(merged[contract_key], candidate)
             else:
                 merged[contract_key] = candidate
+
+        if progress_callback:
+            await progress_callback(
+                stage="provider_complete",
+                provider=source_name,
+                provider_number=provider_number,
+                provider_total=total_providers,
+                discovered=len(merged),
+                provider_found=len(rows),
+            )
 
     # Favor candidates that already have actionable contact/social data.
     ordered = sorted(
@@ -2217,8 +2249,57 @@ async def run_fast_scan(
     preview_blocks: list[str] = []
 
     try:
-        candidates, warnings = await discover_candidates(params)
+        async def update_discovery_progress(**info: Any) -> None:
+            stage = info.get("stage", "discovering")
+            provider = str(info.get("provider") or "sources")
+            provider_number = int(info.get("provider_number") or 0)
+            provider_total = int(info.get("provider_total") or 0)
+            discovered = int(info.get("discovered") or 0)
+            provider_found = int(info.get("provider_found") or 0)
+
+            if stage == "discovering":
+                stage_text = f"🔍 Searching {provider}..."
+            elif stage == "provider_complete":
+                stage_text = (
+                    f"✅ {provider} checked"
+                    + (f" • {provider_found} returned" if provider_found else "")
+                )
+            else:
+                stage_text = f"⚠️ {provider} could not be checked"
+
+            await progress.edit(
+                (
+                    "⚡ Project Hunter scan running\n\n"
+                    f"Type: {params.asset_type.upper()}\n"
+                    + (
+                        f"Launchpad: {params.launchpad}\n"
+                        if params.asset_type == "meme"
+                        else f"Sector: {params.sector}\n"
+                    )
+                    + f"Source: {params.source}\n\n"
+                    f"Stage: {stage_text}\n"
+                    f"Sources checked: {provider_number - (1 if stage == 'discovering' else 0)}/{provider_total}\n"
+                    f"Discovered so far: {discovered}\n"
+                    f"Saved: {inserted_count}/{params.target_count}\n"
+                    f"Skipped: {skipped_socials}"
+                )
+            )
+
+        candidates, warnings = await discover_candidates(
+            params,
+            progress_callback=update_discovery_progress,
+        )
         inspected = len(candidates)
+
+        await progress.edit(
+            (
+                "⚡ Project Hunter scan running\n\n"
+                "Stage: 🧹 Filtering & saving\n"
+                f"Discovered: {inspected}\n"
+                f"Saved: {inserted_count}/{params.target_count}\n"
+                f"Skipped: {skipped_socials}"
+            )
+        )
 
         for number, candidate in enumerate(candidates, start=1):
             # Preserve the current deep-analysis contract:
@@ -2270,10 +2351,12 @@ async def run_fast_scan(
             await progress.edit(
                 (
                     "⚡ Project Hunter scan running\n\n"
-                    f"Candidates processed: {number}/{len(candidates)}\n"
-                    f"New saved: {inserted_count}\n"
-                    f"Merged/known: {merged_count}\n"
-                    f"Missing required socials: {skipped_socials}\n"
+                    "Stage: 💾 Filtering & saving\n"
+                    f"Discovered: {len(candidates)}\n"
+                    f"Processed: {number}/{len(candidates)}\n"
+                    f"Saved: {inserted_count}/{params.target_count}\n"
+                    f"Known/merged: {merged_count}\n"
+                    f"Skipped: {skipped_socials}\n"
                     f"Current: {candidate.name}"
                 )
             )
