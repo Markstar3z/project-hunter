@@ -3816,7 +3816,9 @@ async def scan_menu_callback(event: events.CallbackQuery.Event) -> None:
 # BOT COMMANDS
 # =========================================================
 
-@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
+@bot_client.on(
+    events.NewMessage(pattern=r"(?i)^/start(?:@\w+)?$")
+)
 async def start_handler(event: events.NewMessage.Event) -> None:
     if not authorized(event):
         await event.reply("This bot is private.")
