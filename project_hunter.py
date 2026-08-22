@@ -4060,7 +4060,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter v2 connected as @%s",
+        "Project Hunter v4.1 connected as @%s",
         bot.username,
     )
     LOGGER.info(
