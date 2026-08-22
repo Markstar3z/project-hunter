@@ -59,10 +59,11 @@ ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "10000"))
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP", "1000000000"))
 
-MEME_MIN_MARKET_CAP = int(os.getenv("MEME_MIN_MARKET_CAP", "10000"))
+MEME_MIN_MARKET_CAP = int(os.getenv("MEME_MIN_MARKET_CAP", "50000"))
 MEME_MAX_MARKET_CAP = int(os.getenv("MEME_MAX_MARKET_CAP", "50000000"))
 MEME_MIN_LIQUIDITY = float(os.getenv("MEME_MIN_LIQUIDITY", "5000"))
 MEME_MIN_VOLUME_24H = float(os.getenv("MEME_MIN_VOLUME_24H", "5000"))
+MEME_MAX_AGE_DAYS = int(os.getenv("MEME_MAX_AGE_DAYS", "7"))
 MEME_DEFAULT_CHAIN = os.getenv("MEME_DEFAULT_CHAIN", "solana").strip().lower()
 
 FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "250"))
@@ -1387,6 +1388,21 @@ def candidate_from_dex_pair(
     )
 
 
+
+def meme_candidate_is_recent(candidate: DiscoveryCandidate) -> bool:
+    """Return True when creation time is unknown or no older than configured limit."""
+    if not candidate.pair_created_at:
+        return True
+
+    created = int(candidate.pair_created_at)
+    # Providers normally return milliseconds; tolerate seconds too.
+    if created > 10_000_000_000:
+        created /= 1000
+
+    age_seconds = utc_now().timestamp() - created
+    return age_seconds <= MEME_MAX_AGE_DAYS * 86400
+
+
 def enrich_with_dex(candidate: DiscoveryCandidate) -> DiscoveryCandidate:
     if not candidate.chain or not candidate.contract_address:
         return candidate
@@ -1667,6 +1683,8 @@ async def discover_mobula(params: FastScanParams) -> list[DiscoveryCandidate]:
                 continue
             if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
                 continue
+            if not meme_candidate_is_recent(candidate):
+                continue
 
         candidates.append(candidate)
         if len(candidates) >= params.target_count:
@@ -1775,6 +1793,8 @@ async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
             if candidate.liquidity < MEME_MIN_LIQUIDITY:
                 continue
             if candidate.volume_24h < MEME_MIN_VOLUME_24H:
+                continue
+            if not meme_candidate_is_recent(candidate):
                 continue
 
         candidates.append(candidate)
