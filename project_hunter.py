@@ -86,6 +86,8 @@ TG_MESSAGE_SCAN_LIMIT = int(os.getenv("TG_MESSAGE_SCAN_LIMIT", "150"))
 ENTITY_CACHE_LIMIT_USER = int(os.getenv("ENTITY_CACHE_LIMIT_USER", "200"))
 ENTITY_CACHE_LIMIT_BOT = int(os.getenv("ENTITY_CACHE_LIMIT_BOT", "100"))
 GC_EVERY_N_PROJECTS = int(os.getenv("GC_EVERY_N_PROJECTS", "10"))
+FUNDRAISING_SOURCE_TIMEOUT = int(os.getenv("FUNDRAISING_SOURCE_TIMEOUT", "15"))
+FUNDRAISING_OVERALL_TIMEOUT = int(os.getenv("FUNDRAISING_OVERALL_TIMEOUT", "60"))
 
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 X_API_BASE = "https://api.x.com/2"
@@ -1437,7 +1439,7 @@ class DefiLlamaRaisesSource:
     url = "https://defillama.com/raises"
 
     def fetch(self, http: Any, limit: int = 100) -> list[FundraisingCandidate]:
-        response = http.get(self.url, timeout=30)
+        response = http.get(self.url, timeout=FUNDRAISING_SOURCE_TIMEOUT)
         response.raise_for_status()
         parser = _TableParser(); parser.feed(response.text)
         results: list[FundraisingCandidate] = []
@@ -1469,7 +1471,7 @@ class CryptoRankUpcomingSource:
     url = "https://cryptorank.io/upcoming-ico"
 
     def fetch(self, http: Any, limit: int = 100) -> list[FundraisingCandidate]:
-        response = http.get(self.url, timeout=30)
+        response = http.get(self.url, timeout=FUNDRAISING_SOURCE_TIMEOUT)
         response.raise_for_status()
         parser = _TableParser(); parser.feed(response.text)
         results: list[FundraisingCandidate] = []
@@ -1499,7 +1501,7 @@ class GitcoinProgramsSource:
     url = "https://grants.gitcoin.co/"
 
     def fetch(self, http: Any, limit: int = 30) -> list[FundraisingCandidate]:
-        response = http.get(self.url, timeout=30); response.raise_for_status()
+        response = http.get(self.url, timeout=FUNDRAISING_SOURCE_TIMEOUT); response.raise_for_status()
         text = html.unescape(" ".join(re.sub(r"<[^>]+>", " ", response.text).split()))
         domains = ["Developer Tooling & Infrastructure", "Interop Standards, Infra and Analytics", "Public Goods R&D", "Targeted Development & Adoption", "Privacy"]
         active = "applications open" in text.lower()
@@ -1516,7 +1518,7 @@ class OutlierAcceleratorSource:
     url = "https://outlierventures.io/base-camp/"
 
     def fetch(self, http: Any, limit: int = 30) -> list[FundraisingCandidate]:
-        response = http.get(self.url, timeout=30); response.raise_for_status()
+        response = http.get(self.url, timeout=FUNDRAISING_SOURCE_TIMEOUT); response.raise_for_status()
         text = html.unescape(" ".join(re.sub(r"<[^>]+>", " ", response.text).split()))
         programs = ["Post Web Base Camp", "Injective Catalyst", "Ascent Token Launch Accelerator", "DePIN Base Camp", "RWA Base Camp", "AI x Crypto Base Camp", "FutureSpark Base Camp", "Bitcoin Base Camp"]
         status = "active" if re.search(r"accepting|register interest|apply", text, re.I) else "uncertain"
@@ -4709,15 +4711,129 @@ def fundraising_menu()->list[list[Button]]:
     return [[Button.inline('🔥 Currently Raising',b'fund:raising'),Button.inline('🆕 Recently Announced',b'fund:recent')],[Button.inline('🚀 Upcoming Sales',b'fund:upcoming'),Button.inline('🎁 Grants',b'fund:grants')],[Button.inline('🏗 Accelerators',b'fund:accelerators'),Button.inline('📊 Stats',b'fund:stats')],[Button.inline('🔄 Refresh Sources',b'fund:refresh')]]
 
 async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]:
-    status=None if silent else await send_event_message(event,'💰 Refreshing fundraising intelligence...')
-    rows,errors=await asyncio.to_thread(FUNDRAISING.discover,100); saved=0
-    for candidate in rows:
-        d=candidate.to_dict(); existing=_find_existing_project_for_fundraising(d); ps=int(existing.get('score') or 0) if existing else 0
-        if existing:
-            d['website']=d.get('website') or existing.get('website') or ''; d['x_url']=d.get('x_url') or existing.get('x_url') or ''; d['telegram_url']=d.get('telegram_url') or existing.get('telegram_url') or ''
-        os,reasons=fundraising_opportunity_score(d,existing); OPPORTUNITY_STORAGE.upsert_fundraising(d,ps,os,reasons); saved+=1
-    if status: await status.edit(f"✅ Fundraising refresh complete\n\nRecords processed: {saved}\nSource failures: {len(errors)}")
-    return saved,errors
+    status = None if silent else await send_event_message(
+        event,
+        (
+            "💰 Refreshing fundraising intelligence...\n\n"
+            f"Sources checked: 0/{len(FUNDRAISING.sources)}\n"
+            "Current: starting..."
+        ),
+    )
+
+    async def _run() -> tuple[int, list[str]]:
+        collected = []
+        errors = []
+        total = len(FUNDRAISING.sources)
+
+        for index, source in enumerate(FUNDRAISING.sources, start=1):
+            LOGGER.info("Fundraising source %s/%s started: %s", index, total, source.name)
+
+            if status:
+                await status.edit(
+                    (
+                        "💰 Refreshing fundraising intelligence...\n\n"
+                        f"Sources checked: {index - 1}/{total}\n"
+                        f"Current: 🔍 {source.name}\n"
+                        f"Collected: {len(collected)}"
+                    )
+                )
+
+            try:
+                rows = await asyncio.wait_for(
+                    asyncio.to_thread(source.fetch, FUNDRAISING.http, 100),
+                    timeout=FUNDRAISING_SOURCE_TIMEOUT + 5,
+                )
+                LOGGER.info("Fundraising source completed: %s (%s rows)", source.name, len(rows))
+                collected.extend(rows)
+                source_failed = False
+            except asyncio.TimeoutError:
+                errors.append(f"{source.name}: timeout")
+                LOGGER.warning("Fundraising source timed out: %s", source.name)
+                source_failed = True
+            except Exception as exc:
+                errors.append(f"{source.name}: {type(exc).__name__}: {exc}")
+                LOGGER.exception("Fundraising source failed: %s", source.name)
+                source_failed = True
+
+            if status:
+                await status.edit(
+                    (
+                        "💰 Refreshing fundraising intelligence...\n\n"
+                        f"Sources checked: {index}/{total}\n"
+                        f"Last: {'⚠️' if source_failed else '✅'} {source.name}\n"
+                        f"Collected: {len(collected)}\n"
+                        f"Failures: {len(errors)}"
+                    )
+                )
+
+        seen = set()
+        unique = []
+        for candidate in collected:
+            if candidate.stable_key in seen:
+                continue
+            seen.add(candidate.stable_key)
+            unique.append(candidate)
+
+        unique.sort(
+            key=lambda row: row.announcement_date.timestamp() if row.announcement_date else 0,
+            reverse=True,
+        )
+
+        saved = 0
+        for candidate in unique:
+            d = candidate.to_dict()
+            existing = _find_existing_project_for_fundraising(d)
+            ps = int(existing.get("score") or 0) if existing else 0
+
+            if existing:
+                d["website"] = d.get("website") or existing.get("website") or ""
+                d["x_url"] = d.get("x_url") or existing.get("x_url") or ""
+                d["telegram_url"] = d.get("telegram_url") or existing.get("telegram_url") or ""
+
+            opp_score, reasons = fundraising_opportunity_score(d, existing)
+            OPPORTUNITY_STORAGE.upsert_fundraising(d, ps, opp_score, reasons)
+            saved += 1
+
+        return saved, errors
+
+    try:
+        saved, errors = await asyncio.wait_for(
+            _run(),
+            timeout=FUNDRAISING_OVERALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.error(
+            "Fundraising refresh exceeded overall timeout of %ss",
+            FUNDRAISING_OVERALL_TIMEOUT,
+        )
+
+        if status:
+            await status.edit(
+                (
+                    "⚠️ Fundraising refresh stopped\n\n"
+                    f"Overall timeout reached after {FUNDRAISING_OVERALL_TIMEOUT}s.\n"
+                    "Project Hunter is still running normally."
+                )
+            )
+
+        return 0, [f"Overall timeout after {FUNDRAISING_OVERALL_TIMEOUT}s"]
+
+    LOGGER.info(
+        "Fundraising refresh complete: saved=%s failures=%s",
+        saved,
+        len(errors),
+    )
+
+    if status:
+        await status.edit(
+            (
+                "✅ Fundraising refresh complete\n\n"
+                f"Records processed: {saved}\n"
+                f"Source failures: {len(errors)}"
+            )
+        )
+
+    return saved, errors
 
 @bot_client.on(events.NewMessage(pattern=r'(?i)^/fundraising(?:@\w+)?(?:\s+.*)?$'))
 async def fundraising_handler(event:events.NewMessage.Event)->None:
@@ -4878,7 +4994,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter v2 connected as @%s",
+        "Project Hunter Opportunity v1 connected as @%s",
         bot.username,
     )
     LOGGER.info(
@@ -4886,6 +5002,11 @@ async def main() -> None:
         bool(COINGECKO_API_KEY),
         bool(MOBULA_API_KEY),
         bool(BIRDEYE_API_KEY),
+    )
+    LOGGER.info(
+        "Fundraising timeouts: per_source=%ss overall=%ss",
+        FUNDRAISING_SOURCE_TIMEOUT,
+        FUNDRAISING_OVERALL_TIMEOUT,
     )
     LOGGER.info(
         "Low-memory mode active: page_size=%s, "
