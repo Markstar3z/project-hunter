@@ -1295,7 +1295,7 @@ from dataclasses import dataclass, field
 LOGGER = logging.getLogger(__name__)
 
 
-def fundraising_fundraising_utc_now() -> datetime:
+def fundraising_utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -1314,16 +1314,48 @@ def parse_money(value: str) -> Optional[float]:
 
 def parse_date(value: str) -> Optional[datetime]:
     text = (value or "").strip()
+
     if not text or text.upper() == "TBA":
         return None
-    for fmt in ("%b %d, %Y", "%b %d %Y", "%Y-%m-%d", "%b %d"):
+
+    # Full dates first.
+    for fmt in ("%b %d, %Y", "%b %d %Y", "%Y-%m-%d", "%d %b %Y"):
         try:
-            parsed = datetime.strptime(text, fmt)
-            if fmt == "%b %d":
-                parsed = parsed.replace(year=fundraising_utc_now().year)
-            return parsed.replace(tzinfo=timezone.utc)
+            return datetime.strptime(
+                text,
+                fmt,
+            ).replace(tzinfo=timezone.utc)
         except ValueError:
-            pass
+            continue
+
+    # Month/day without year. Add the current year explicitly instead of
+    # relying on strptime's deprecated implicit-year behavior.
+    month_day_match = re.fullmatch(
+        r"([A-Za-z]{3,9})\s+(\d{1,2})",
+        text,
+    )
+
+    if month_day_match:
+        current_year = utc_now().year
+
+        for fmt in ("%b %d %Y", "%B %d %Y"):
+            try:
+                parsed = datetime.strptime(
+                    f"{text} {current_year}",
+                    fmt,
+                ).replace(tzinfo=timezone.utc)
+
+                # If the parsed month/day is far in the past, it is more likely
+                # referring to the next calendar year for an upcoming sale.
+                if parsed < utc_now() - timedelta(days=180):
+                    parsed = parsed.replace(
+                        year=current_year + 1,
+                    )
+
+                return parsed
+            except ValueError:
+                continue
+
     return None
 
 
@@ -1345,7 +1377,7 @@ def normalize_round(value: str) -> str:
 def funding_status(event_date: Optional[datetime], funding_type: str) -> str:
     if event_date is None:
         return "uncertain"
-    delta = (event_date - fundraising_utc_now()).total_seconds()
+    delta = (event_date - utc_now()).total_seconds()
     if delta > 0:
         return "upcoming"
     age_days = abs(delta) / 86400
@@ -1487,7 +1519,7 @@ class CryptoRankUpcomingSource:
                 funding_type=ftype, funding_stage=sale_type,
                 funding_amount=parse_money(row[3] if len(row) > 3 else ""),
                 announcement_date=event_date,
-                status="upcoming" if when.upper() == "TBA" or (event_date and event_date >= fundraising_utc_now()) else "active_or_recent",
+                status="upcoming" if when.upper() == "TBA" or (event_date and event_date >= utc_now()) else "active_or_recent",
                 sector="Token sale",
                 investors=[x.strip() for x in (row[6] if len(row) > 6 else "").split(",") if x.strip()],
                 description=(f"Launchpad: {row[4].strip()}" if len(row) > 4 and row[4].strip() else "Upcoming public token sale"),
@@ -1497,20 +1529,140 @@ class CryptoRankUpcomingSource:
 
 
 class GitcoinProgramsSource:
-    name = "Gitcoin Grants"
-    url = "https://grants.gitcoin.co/"
+    name = "Gitcoin Funding Campaigns"
+    url = "https://gitcoin.co/campaigns"
 
-    def fetch(self, http: Any, limit: int = 30) -> list[FundraisingCandidate]:
-        response = http.get(self.url, timeout=FUNDRAISING_SOURCE_TIMEOUT); response.raise_for_status()
-        text = html.unescape(" ".join(re.sub(r"<[^>]+>", " ", response.text).split()))
-        domains = ["Developer Tooling & Infrastructure", "Interop Standards, Infra and Analytics", "Public Goods R&D", "Targeted Development & Adoption", "Privacy"]
-        active = "applications open" in text.lower()
-        return [FundraisingCandidate(
-            project_name=f"Gitcoin: {domain}", source_platform=self.name, source_url=self.url,
-            funding_type="Grant", funding_stage="Open grant program", status="active" if active else "uncertain",
-            sector=domain, description="Public Web3 grant/funding program. Verify current application rules and deadlines at source.",
-            record_kind="program",
-        ) for domain in domains if domain.lower() in text.lower()][:limit]
+    def fetch(
+        self,
+        http: Any,
+        limit: int = 30,
+    ) -> list[FundraisingCandidate]:
+        response = http.get(
+            self.url,
+            timeout=FUNDRAISING_SOURCE_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        # The public campaigns page is text-rich and currently lists active,
+        # upcoming, and historical Ethereum funding campaigns.
+        text = html.unescape(
+            re.sub(
+                r"<[^>]+>",
+                " ",
+                response.text,
+            )
+        )
+        text = " ".join(text.split())
+
+        results: list[FundraisingCandidate] = []
+
+        # Extract useful public campaigns without depending heavily on DOM shape.
+        known_campaigns = [
+            {
+                "name": "TheDAO Security Fund",
+                "keywords": ["TheDAO Security Fund"],
+                "sector": "Ethereum Security",
+            },
+            {
+                "name": "Protocol Guild",
+                "keywords": ["Protocol Guild"],
+                "sector": "Ethereum Core Development",
+            },
+            {
+                "name": "Gitcoin Grants",
+                "keywords": ["Gitcoin Grants"],
+                "sector": "Public Goods / Ethereum",
+            },
+        ]
+
+        for campaign in known_campaigns:
+            if not any(
+                keyword.lower() in text.lower()
+                for keyword in campaign["keywords"]
+            ):
+                continue
+
+            # Detect active/upcoming wording near the campaign name where possible.
+            position = text.lower().find(
+                campaign["name"].lower()
+            )
+            context = (
+                text[max(0, position - 160):position + 420]
+                if position >= 0
+                else text
+            )
+
+            context_lower = context.lower()
+
+            if "ongoing" in context_lower:
+                status = "active"
+            elif "upcoming" in context_lower:
+                status = "upcoming"
+            elif "ended" in context_lower:
+                status = "completed"
+            else:
+                status = "uncertain"
+
+            amount = None
+            amount_match = re.search(
+                r"(?:Matching Pool|Pool|Funding)\\s*\\$([0-9,.]+\\s*[KMB]?)",
+                context,
+                re.I,
+            )
+            if amount_match:
+                amount = parse_money(
+                    amount_match.group(1)
+                )
+
+            results.append(
+                FundraisingCandidate(
+                    project_name=campaign["name"],
+                    source_platform=self.name,
+                    source_url=self.url,
+                    funding_type="Grant",
+                    funding_stage="Funding campaign",
+                    funding_amount=amount,
+                    status=status,
+                    sector=campaign["sector"],
+                    description=(
+                        "Public Gitcoin funding campaign. "
+                        "Verify the campaign page for the latest eligibility, "
+                        "application, and participation details."
+                    ),
+                    record_kind="program",
+                )
+            )
+
+            if len(results) >= limit:
+                break
+
+        # Generic fallback: if the page is reachable and clearly advertises
+        # active/upcoming funding campaigns but none of the known names parsed.
+        if (
+            not results
+            and (
+                "active or upcoming funding rounds" in text.lower()
+                or "funding campaigns" in text.lower()
+            )
+        ):
+            results.append(
+                FundraisingCandidate(
+                    project_name="Gitcoin Funding Campaigns",
+                    source_platform=self.name,
+                    source_url=self.url,
+                    funding_type="Grant",
+                    funding_stage="Funding campaign directory",
+                    status="active",
+                    sector="Ethereum / Public Goods",
+                    description=(
+                        "Gitcoin's public directory of active and upcoming "
+                        "funding campaigns."
+                    ),
+                    record_kind="program",
+                )
+            )
+
+        return results[:limit]
 
 
 class OutlierAcceleratorSource:
@@ -4994,7 +5146,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter Opportunity v1 connected as @%s",
+        "Project Hunter Opportunity v1.1 connected as @%s",
         bot.username,
     )
     LOGGER.info(
