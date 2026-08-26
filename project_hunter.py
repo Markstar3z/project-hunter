@@ -4046,6 +4046,66 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
 
 
 
+
+# =========================================================
+# MAIN NAVIGATION UI
+# =========================================================
+
+def persistent_main_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.text("📂 Menu", resize=True),
+            Button.text("🔎 Quick Scan", resize=True),
+        ]
+    ]
+
+
+def main_sections_keyboard() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("💎 Altcoins", b"main:alt"),
+            Button.inline("🐸 Memecoins", b"main:meme"),
+            Button.inline("💰 Fundraising", b"main:fundraising"),
+        ],
+        [
+            Button.inline("📊 Results", b"main:results"),
+            Button.inline("⭐ Watchlist", b"main:watchlist"),
+            Button.inline("🚨 Signals", b"main:signals"),
+        ],
+        [
+            Button.inline("🎯 Leads", b"main:leads"),
+            Button.inline("🔬 Analyze", b"main:analyze"),
+            Button.inline("📈 Stats", b"main:stats"),
+        ],
+        [
+            Button.inline("🛠 Sources", b"main:sources"),
+            Button.inline("🌐 Scan All", b"main:scanall"),
+            Button.inline("❌ Close", b"main:close"),
+        ],
+    ]
+
+
+async def show_main_sections(event: Any, *, edit: bool = False) -> None:
+    text = (
+        "📂 PROJECT HUNTER\n\n"
+        "Choose a section:"
+    )
+
+    if edit and isinstance(event, events.CallbackQuery.Event):
+        await event.edit(
+            text,
+            buttons=main_sections_keyboard(),
+            link_preview=False,
+        )
+    else:
+        await send_event_message(
+            event,
+            text,
+            buttons=main_sections_keyboard(),
+            link_preview=False,
+        )
+
+
 # =========================================================
 # INLINE SCAN UI
 # =========================================================
@@ -4084,6 +4144,7 @@ def scan_root_keyboard() -> list[list[Button]]:
             Button.inline("ℹ️ Sources", b"scan:sources"),
         ],
         [
+            Button.inline("📂 Sections", b"main:home"),
             Button.inline("❌ Close", b"scan:close"),
         ],
     ]
@@ -4621,11 +4682,214 @@ async def scan_menu_callback(event: events.CallbackQuery.Event) -> None:
     await event.answer("Unknown menu action.", alert=True)
 
 
+
+@bot_client.on(events.CallbackQuery(pattern=rb"^main:"))
+async def main_sections_callback(event: events.CallbackQuery.Event) -> None:
+    if not authorized(event):
+        await event.answer("This bot is private.", alert=True)
+        return
+
+    await event.answer()
+    action = event.data.decode("utf-8").split(":", 1)[1]
+
+    if action == "home":
+        await show_main_sections(event, edit=True)
+        return
+
+    if action == "alt":
+        state = default_scan_ui_state()
+        state["asset_type"] = "alt"
+        state["page"] = "sector"
+        scan_ui_state[event.chat_id] = state
+        await event.edit(
+            "💎 ALTCOINS\n\nChoose a sector:",
+            buttons=alt_sector_keyboard(),
+            link_preview=False,
+        )
+        return
+
+    if action == "meme":
+        state = default_scan_ui_state()
+        state["asset_type"] = "meme"
+        state["page"] = "launchpad"
+        scan_ui_state[event.chat_id] = state
+        await event.edit(
+            "🐸 MEMECOINS\n\nChoose a launchpad:",
+            buttons=meme_launchpad_keyboard(),
+            link_preview=False,
+        )
+        return
+
+    if action == "fundraising":
+        await event.edit(
+            "💰 FUNDRAISING INTELLIGENCE\n\nChoose a section:",
+            buttons=fundraising_menu(),
+            link_preview=False,
+        )
+        return
+
+    if action == "results":
+        rows = STORAGE.list_projects(None, 10)
+        await event.edit(
+            "📊 LATEST RESULTS\n\n" + format_saved(rows),
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+            link_preview=False,
+        )
+        return
+
+    if action == "watchlist":
+        rows = OPPORTUNITY_STORAGE.watch_rows(20)
+        if not rows:
+            text = "⭐ WATCHLIST\n\nNo watched opportunities yet."
+        else:
+            blocks = [
+                (
+                    f"#{row['id']} {row['project_name']}\n"
+                    f"Type: {row['entity_type']}\n"
+                    f"Project score: {row['project_score']}/100\n"
+                    f"Opportunity score: {row['opportunity_score']}/100"
+                )
+                for row in rows
+            ]
+            text = "⭐ WATCHLIST\n\n" + "\n\n".join(blocks)
+        await event.edit(
+            text,
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+            link_preview=False,
+        )
+        return
+
+    if action == "signals":
+        rows = OPPORTUNITY_STORAGE.signals(10)
+        if not rows:
+            text = "🚨 SIGNALS\n\nNo meaningful signals stored yet.\nUse /signals to run a fresh check."
+        else:
+            text = "🚨 SIGNALS\n\n" + "\n\n".join(
+                (
+                    f"{r['project_name']}\n"
+                    f"Signal: {r['signal_type']}\n"
+                    f"Importance: {r['importance']}/100\n"
+                    f"{r.get('explanation') or ''}"
+                )
+                for r in rows
+            )
+        await event.edit(
+            text,
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+            link_preview=False,
+        )
+        return
+
+    if action == "leads":
+        rows = OPPORTUNITY_STORAGE.leads(15)
+        if not rows:
+            text = "🎯 LEADS\n\nNo prioritized leads yet.\nUse /leads after adding projects to the watchlist."
+        else:
+            text = "🎯 LEADS\n\n" + "\n\n".join(
+                (
+                    f"{r['bucket']}\n"
+                    f"Project: {r['project_name']}\n"
+                    f"Why now: {r['rationale']}"
+                )
+                for r in rows
+            )
+        await event.edit(
+            text,
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+            link_preview=False,
+        )
+        return
+
+    if action == "analyze":
+        pending = STORAGE.pending_projects(20)
+        await event.edit(
+            (
+                "🔬 ANALYSIS\n\n"
+                f"Pending projects: {len(pending)}\n\n"
+                "Use /analyze to begin the deep checks."
+            ),
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+        )
+        return
+
+    if action == "stats":
+        counts = STORAGE.counts()
+        opp = OPPORTUNITY_STORAGE.stats()
+        await event.edit(
+            (
+                "📈 PROJECT HUNTER STATS\n\n"
+                f"Projects: {counts['total']}\n"
+                f"Pending: {counts['pending']}\n"
+                f"Priority: {counts['priority']}\n"
+                f"Qualified: {counts['qualified']}\n"
+                f"Scored watchlist: {counts['watchlist']}\n"
+                f"Rejected: {counts['rejected']}\n\n"
+                f"Fundraising events: {opp['fundraising']}\n"
+                f"Watched opportunities: {opp['watchlist']}\n"
+                f"Signals: {opp['signals']}\n"
+                f"Leads: {opp['leads']}"
+            ),
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+        )
+        return
+
+    if action == "sources":
+        await event.edit(
+            (
+                "🛠 SOURCES\n\n"
+                "Normal discovery:\n"
+                "• CoinGecko\n"
+                "• Mobula\n"
+                "• Birdeye\n"
+                "• DEX Screener\n\n"
+                "Fundraising:\n"
+                "• DefiLlama Raises\n"
+                "• CryptoRank Upcoming Sales\n"
+                "• Gitcoin Funding Campaigns\n"
+                "• Outlier Ventures"
+            ),
+            buttons=[[Button.inline("📂 Menu", b"main:home")]],
+        )
+        return
+
+    if action == "scanall":
+        state = default_scan_ui_state()
+        state["asset_type"] = "all"
+        state["source"] = "all"
+        state["page"] = "count"
+        scan_ui_state[event.chat_id] = state
+        await event.edit(
+            "🌐 SCAN EVERYTHING\n\nHow many projects should Hunter target?",
+            buttons=count_keyboard(),
+            link_preview=False,
+        )
+        return
+
+    if action == "close":
+        await event.edit(
+            "Menu closed. Tap 📂 Menu below whenever you need it.",
+            buttons=None,
+        )
+
+
+@bot_client.on(events.NewMessage(pattern=r"^📂 Menu$"))
+async def main_menu_text_handler(event: events.NewMessage.Event) -> None:
+    if authorized(event):
+        await show_main_sections(event)
+
+
+@bot_client.on(events.NewMessage(pattern=r"^🔎 Quick Scan$"))
+async def quick_scan_text_handler(event: events.NewMessage.Event) -> None:
+    if authorized(event):
+        scan_ui_state[event.chat_id] = default_scan_ui_state()
+        await show_scan_root(event)
+
+
 # =========================================================
 # BOT COMMANDS
 # =========================================================
 
-@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
+@bot_client.on(events.NewMessage(pattern=r"(?i)^/start(?:@\w+)?$"))
 async def start_handler(event: events.NewMessage.Event) -> None:
     if not authorized(event):
         await event.reply("This bot is private.")
@@ -4633,41 +4897,17 @@ async def start_handler(event: events.NewMessage.Event) -> None:
 
     await event.reply(
         (
-            "Project Hunter v3 Multi-Source\n\n"
-            "Main scanner:\n"
-            "/scan — open the interactive menu\n\n"
-            "Altcoin discovery:\n"
-            "/scan alt all all 50\n"
-            "/scan alt ai coingecko 50\n"
-            "/scan alt defi mobula 30\n\n"
-            "Memecoin discovery:\n"
-            "/scan meme all all 50\n"
-            "/scan meme pumpfun birdeye 50\n"
-            "/scan meme pumpfun mobula 30 solana\n\n"
-            "Everything:\n"
-            "/scan all 50\n\n"
-            "Legacy syntax still works:\n"
-            "/scan 50 artificial-intelligence\n\n"
-            "Discovery help:\n"
-            "/sources\n"
-            "/sectors\n\n"
-            "Deep analysis:\n"
-            "/analyze\n"
-            "/analyze 20\n\n"
-            "Saved results:\n"
-            "/pending\n"
-            "/priority\n"
-            "/qualified\n"
-            "/watchlist\n"
-            "/rejected\n"
-            "/latest\n"
-            "/count"
+            "🔎 PROJECT HUNTER\n\n"
+            "Web3 project and opportunity intelligence.\n\n"
+            "Use 📂 Menu below to open all sections, or 🔎 Quick Scan "
+            "to jump directly into project discovery."
         ),
+        buttons=persistent_main_keyboard(),
         link_preview=False,
     )
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/scan(?:@\w+)?(?:\s+.*)?$"))
+@bot_client.on(events.NewMessage(pattern=r"(?i)^/scan(?:@\w+)?(?:\s+.*)?$"))
 async def scan_handler(event: events.NewMessage.Event) -> None:
     if not authorized(event):
         await event.reply("This bot is private.")
@@ -4842,14 +5082,52 @@ async def count_handler(event: events.NewMessage.Event) -> None:
 # OPPORTUNITY INTELLIGENCE
 # =========================================================
 
-def _find_existing_project_for_fundraising(event: dict[str, Any]) -> Optional[dict[str, Any]]:
-    name=str(event.get('project_name') or '').strip().lower(); web=normalize_website(event.get('website')); xu=normalize_x_username(event.get('x_url'))
-    with STORAGE.connect() as c: rows=c.execute('SELECT * FROM projects ORDER BY id DESC LIMIT 500').fetchall()
+def _build_fundraising_project_index() -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+
+    with STORAGE.connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM projects ORDER BY id DESC LIMIT 1000"
+        ).fetchall()
+
     for raw in rows:
-        row=dict(raw)
-        if web and normalize_website(row.get('website'))==web:return row
-        if xu and normalize_x_username(row.get('x_username') or row.get('x_url'))==xu:return row
-        if name and str(row.get('name') or '').strip().lower()==name:return row
+        row = dict(raw)
+
+        website = normalize_website(row.get("website"))
+        if website:
+            index.setdefault(f"web:{website}", row)
+
+        x_user = normalize_x_username(
+            row.get("x_username") or row.get("x_url")
+        )
+        if x_user:
+            index.setdefault(f"x:{x_user}", row)
+
+        name = str(row.get("name") or "").strip().lower()
+        if name:
+            index.setdefault(f"name:{name}", row)
+
+    return index
+
+
+def _find_existing_project_for_fundraising(
+    event: dict[str, Any],
+    index: Optional[dict[str, dict[str, Any]]] = None,
+) -> Optional[dict[str, Any]]:
+    index = index or _build_fundraising_project_index()
+
+    website = normalize_website(event.get("website"))
+    if website and f"web:{website}" in index:
+        return index[f"web:{website}"]
+
+    x_user = normalize_x_username(event.get("x_url"))
+    if x_user and f"x:{x_user}" in index:
+        return index[f"x:{x_user}"]
+
+    name = str(event.get("project_name") or "").strip().lower()
+    if name and f"name:{name}" in index:
+        return index[f"name:{name}"]
+
     return None
 
 def _fundraising_text(row:dict[str,Any])->str:
@@ -4859,8 +5137,28 @@ def _fundraising_text(row:dict[str,Any])->str:
     except Exception: reasons=[]
     return (f"Project: {row['project_name']}\nFunding: {row.get('funding_type') or 'Other'}"+(f" ({row.get('funding_stage')})" if row.get('funding_stage') else '')+f"\nAmount: {amount}\nStatus: {row.get('status') or 'uncertain'}\nSector: {row.get('sector') or 'Unknown'}\nProject Score: {int(row.get('project_score') or 0)}/100\nOpportunity Score: {int(row.get('opportunity_score') or 0)}/100"+(' 🔥' if int(row.get('opportunity_score') or 0)>=80 else '')+f"\nSource: {row.get('source_platform')}\nWhy: {', '.join(reasons[:3]) if reasons else 'Limited enrichment available'}\nURL: {row.get('source_url')}")
 
-def fundraising_menu()->list[list[Button]]:
-    return [[Button.inline('🔥 Currently Raising',b'fund:raising'),Button.inline('🆕 Recently Announced',b'fund:recent')],[Button.inline('🚀 Upcoming Sales',b'fund:upcoming'),Button.inline('🎁 Grants',b'fund:grants')],[Button.inline('🏗 Accelerators',b'fund:accelerators'),Button.inline('📊 Stats',b'fund:stats')],[Button.inline('🔄 Refresh Sources',b'fund:refresh')]]
+def fundraising_menu() -> list[list[Button]]:
+    return [
+        [
+            Button.inline("🔥 Currently Raising", b"fund:raising"),
+            Button.inline("🆕 Recently Announced", b"fund:recent"),
+        ],
+        [
+            Button.inline("🚀 Upcoming Sales", b"fund:upcoming"),
+            Button.inline("🎁 Grants", b"fund:grants"),
+        ],
+        [
+            Button.inline("🏗 Accelerators", b"fund:accelerators"),
+            Button.inline("🔎 Search", b"fund:search"),
+        ],
+        [
+            Button.inline("📊 Stats", b"fund:stats"),
+            Button.inline("🔄 Refresh", b"fund:refresh"),
+        ],
+        [
+            Button.inline("📂 Main Menu", b"main:home"),
+        ],
+    ]
 
 async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]:
     status = None if silent else await send_event_message(
@@ -4932,19 +5230,73 @@ async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]
         )
 
         saved = 0
-        for candidate in unique:
+        project_index = _build_fundraising_project_index()
+        total_unique = len(unique)
+
+        if status:
+            await status.edit(
+                (
+                    "💰 Fundraising intelligence\n\n"
+                    "Stage: 🧹 Validating & saving\n"
+                    f"Progress: 0/{total_unique}\n"
+                    f"Source failures: {len(errors)}"
+                )
+            )
+
+        for number, candidate in enumerate(unique, start=1):
             d = candidate.to_dict()
-            existing = _find_existing_project_for_fundraising(d)
+            existing = _find_existing_project_for_fundraising(
+                d,
+                project_index,
+            )
             ps = int(existing.get("score") or 0) if existing else 0
 
             if existing:
-                d["website"] = d.get("website") or existing.get("website") or ""
-                d["x_url"] = d.get("x_url") or existing.get("x_url") or ""
-                d["telegram_url"] = d.get("telegram_url") or existing.get("telegram_url") or ""
+                d["website"] = (
+                    d.get("website")
+                    or existing.get("website")
+                    or ""
+                )
+                d["x_url"] = (
+                    d.get("x_url")
+                    or existing.get("x_url")
+                    or ""
+                )
+                d["telegram_url"] = (
+                    d.get("telegram_url")
+                    or existing.get("telegram_url")
+                    or ""
+                )
 
-            opp_score, reasons = fundraising_opportunity_score(d, existing)
-            OPPORTUNITY_STORAGE.upsert_fundraising(d, ps, opp_score, reasons)
+            opp_score, reasons = fundraising_opportunity_score(
+                d,
+                existing,
+            )
+
+            OPPORTUNITY_STORAGE.upsert_fundraising(
+                d,
+                ps,
+                opp_score,
+                reasons,
+            )
             saved += 1
+
+            if status and (
+                number == 1
+                or number == total_unique
+                or number % 5 == 0
+            ):
+                await status.edit(
+                    (
+                        "💰 Fundraising intelligence\n\n"
+                        "Stage: 🧹 Validating & saving\n"
+                        f"Progress: {number}/{total_unique}\n"
+                        f"Saved: {saved}\n"
+                        f"Source failures: {len(errors)}"
+                    )
+                )
+
+            await asyncio.sleep(0)
 
         return saved, errors
 
@@ -4979,19 +5331,30 @@ async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]
     if status:
         await status.edit(
             (
-                "✅ Fundraising refresh complete\n\n"
+                "✅ FUNDRAISING INTELLIGENCE\n\n"
                 f"Records processed: {saved}\n"
-                f"Source failures: {len(errors)}"
-            )
+                f"Source failures: {len(errors)}\n\n"
+                "Choose a section:"
+            ),
+            buttons=fundraising_menu(),
+            link_preview=False,
         )
 
     return saved, errors
 
 @bot_client.on(events.NewMessage(pattern=r'(?i)^/fundraising(?:@\w+)?(?:\s+.*)?$'))
 async def fundraising_handler(event:events.NewMessage.Event)->None:
-    if not authorized(event):return
-    if not OPPORTUNITY_STORAGE.fundraising_rows(limit=1): await refresh_fundraising(event)
-    parts=event.raw_text.split(maxsplit=2)
+    if not authorized(event):
+        return
+
+    had_rows = bool(
+        OPPORTUNITY_STORAGE.fundraising_rows(limit=1)
+    )
+
+    if not had_rows:
+        await refresh_fundraising(event)
+
+    parts = event.raw_text.split(maxsplit=2)
     if len(parts)>=2 and parts[1].lower()=='search':
         query=parts[2].strip() if len(parts)>=3 else ''
         if not query:
@@ -4999,8 +5362,22 @@ async def fundraising_handler(event:events.NewMessage.Event)->None:
         rows=OPPORTUNITY_STORAGE.fundraising_rows(mode='recent',limit=20,query=query)
         if not rows:
             await event.reply(f'No fundraising results found for: {query}'); return
-        await send_long(event,'🔎 FUNDRAISING SEARCH\n\n'+'\n\n'.join(_fundraising_text(r) for r in rows)); return
-    await event.reply('💰 FUNDRAISING INTELLIGENCE\n\nChoose a section:',buttons=fundraising_menu(),link_preview=False)
+        await send_long(
+            event,
+            "🔎 FUNDRAISING SEARCH\n\n"
+            + "\n\n".join(_fundraising_text(r) for r in rows),
+        )
+        return
+
+    if not had_rows:
+        # refresh_fundraising already transformed its progress message into the menu
+        return
+
+    await event.reply(
+        "💰 FUNDRAISING INTELLIGENCE\n\nChoose a section:",
+        buttons=fundraising_menu(),
+        link_preview=False,
+    )
 
 @bot_client.on(events.CallbackQuery(pattern=rb'^fund:'))
 async def fundraising_callback(event:events.CallbackQuery.Event)->None:
@@ -5146,7 +5523,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter Opportunity v1.1 connected as @%s",
+        "Project Hunter Opportunity v1.2 connected as @%s",
         bot.username,
     )
     LOGGER.info(
