@@ -1743,7 +1743,7 @@ def fundraising_opportunity_score(event: dict[str, Any], existing_project: Optio
 # OPPORTUNITY STORAGE
 # =========================================================
 
-def opportunity_opportunity_utc_iso() -> str: return datetime.now(timezone.utc).isoformat()
+def opportunity_utc_iso() -> str: return datetime.now(timezone.utc).isoformat()
 
 class OpportunityStorage:
     def __init__(self, core_storage: Any) -> None:
@@ -5243,60 +5243,125 @@ async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]
                 )
             )
 
+        skipped_records = 0
+
         for number, candidate in enumerate(unique, start=1):
-            d = candidate.to_dict()
-            existing = _find_existing_project_for_fundraising(
-                d,
-                project_index,
-            )
-            ps = int(existing.get("score") or 0) if existing else 0
-
-            if existing:
-                d["website"] = (
-                    d.get("website")
-                    or existing.get("website")
-                    or ""
-                )
-                d["x_url"] = (
-                    d.get("x_url")
-                    or existing.get("x_url")
-                    or ""
-                )
-                d["telegram_url"] = (
-                    d.get("telegram_url")
-                    or existing.get("telegram_url")
-                    or ""
-                )
-
-            opp_score, reasons = fundraising_opportunity_score(
-                d,
-                existing,
+            project_name = getattr(
+                candidate,
+                "project_name",
+                f"record {number}",
             )
 
-            OPPORTUNITY_STORAGE.upsert_fundraising(
-                d,
-                ps,
-                opp_score,
-                reasons,
+            LOGGER.info(
+                "Fundraising record %s/%s processing: %s",
+                number,
+                total_unique,
+                project_name,
             )
-            saved += 1
 
-            if status and (
-                number == 1
-                or number == total_unique
-                or number % 5 == 0
-            ):
+            if status:
+                await status.edit(
+                    (
+                        "💰 Fundraising intelligence\n\n"
+                        "Stage: 🧹 Validating & saving\n"
+                        f"Progress: {number - 1}/{total_unique}\n"
+                        f"Saved: {saved}\n"
+                        f"Skipped: {skipped_records}\n"
+                        f"Current: {project_name}\n"
+                        f"Source failures: {len(errors)}"
+                    )
+                )
+
+            try:
+                d = candidate.to_dict()
+
+                existing = _find_existing_project_for_fundraising(
+                    d,
+                    project_index,
+                )
+                ps = (
+                    int(existing.get("score") or 0)
+                    if existing
+                    else 0
+                )
+
+                if existing:
+                    d["website"] = (
+                        d.get("website")
+                        or existing.get("website")
+                        or ""
+                    )
+                    d["x_url"] = (
+                        d.get("x_url")
+                        or existing.get("x_url")
+                        or ""
+                    )
+                    d["telegram_url"] = (
+                        d.get("telegram_url")
+                        or existing.get("telegram_url")
+                        or ""
+                    )
+
+                opp_score, reasons = fundraising_opportunity_score(
+                    d,
+                    existing,
+                )
+
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        OPPORTUNITY_STORAGE.upsert_fundraising,
+                        d,
+                        ps,
+                        opp_score,
+                        reasons,
+                    ),
+                    timeout=10,
+                )
+
+                saved += 1
+
+                LOGGER.info(
+                    "Fundraising record %s/%s saved: %s",
+                    number,
+                    total_unique,
+                    project_name,
+                )
+
+            except asyncio.TimeoutError:
+                skipped_records += 1
+                LOGGER.warning(
+                    "Fundraising record timed out and was skipped: %s",
+                    project_name,
+                )
+
+            except Exception as exc:
+                skipped_records += 1
+                LOGGER.exception(
+                    "Fundraising record failed and was skipped: %s | %s",
+                    project_name,
+                    exc,
+                )
+
+            if status:
                 await status.edit(
                     (
                         "💰 Fundraising intelligence\n\n"
                         "Stage: 🧹 Validating & saving\n"
                         f"Progress: {number}/{total_unique}\n"
                         f"Saved: {saved}\n"
+                        f"Skipped: {skipped_records}\n"
+                        f"Last: {project_name}\n"
                         f"Source failures: {len(errors)}"
                     )
                 )
 
             await asyncio.sleep(0)
+
+        if skipped_records:
+            errors.append(
+                f"{skipped_records} fundraising record(s) "
+                "failed validation/storage and were skipped"
+            )
 
         return saved, errors
 
@@ -5322,6 +5387,25 @@ async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]
 
         return 0, [f"Overall timeout after {FUNDRAISING_OVERALL_TIMEOUT}s"]
 
+    except Exception as exc:
+        LOGGER.exception(
+            "Unexpected fundraising refresh failure: %s",
+            exc,
+        )
+
+        if status:
+            await status.edit(
+                (
+                    "❌ Fundraising refresh failed\n\n"
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    "Project Hunter is still running."
+                )
+            )
+
+        return 0, [
+            f"{type(exc).__name__}: {exc}"
+        ]
+
     LOGGER.info(
         "Fundraising refresh complete: saved=%s failures=%s",
         saved,
@@ -5332,8 +5416,8 @@ async def refresh_fundraising(event:Any,silent:bool=False)->tuple[int,list[str]]
         await status.edit(
             (
                 "✅ FUNDRAISING INTELLIGENCE\n\n"
-                f"Records processed: {saved}\n"
-                f"Source failures: {len(errors)}\n\n"
+                f"Records saved: {saved}\n"
+                f"Issues: {len(errors)}\n\n"
                 "Choose a section:"
             ),
             buttons=fundraising_menu(),
@@ -5523,7 +5607,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter Opportunity v1.2 connected as @%s",
+        "Project Hunter Opportunity v1.3 connected as @%s",
         bot.username,
     )
     LOGGER.info(
