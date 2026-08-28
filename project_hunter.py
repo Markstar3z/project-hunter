@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import sqlite3
+import time
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -62,17 +64,21 @@ ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "10000"))
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP", "1000000000"))
 
-MEME_MIN_MARKET_CAP = int(os.getenv("MEME_MIN_MARKET_CAP", "10000"))
-MEME_MAX_MARKET_CAP = int(os.getenv("MEME_MAX_MARKET_CAP", "50000000"))
+MEME_MIN_MARKET_CAP = int(os.getenv("MEME_MIN_MARKET_CAP", "50000"))
+MEME_MAX_MARKET_CAP = int(os.getenv("MEME_MAX_MARKET_CAP", "10000000"))
 MEME_MIN_LIQUIDITY = float(os.getenv("MEME_MIN_LIQUIDITY", "5000"))
 MEME_MIN_VOLUME_24H = float(os.getenv("MEME_MIN_VOLUME_24H", "5000"))
+MEME_MAX_AGE_DAYS = int(os.getenv("MEME_MAX_AGE_DAYS", "7"))
 MEME_DEFAULT_CHAIN = os.getenv("MEME_DEFAULT_CHAIN", "solana").strip().lower()
 
-FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "250"))
-DISCOVERY_OVERFETCH_MULTIPLIER = int(os.getenv("DISCOVERY_OVERFETCH_MULTIPLIER", "5"))
+FAST_SCAN_MAX_INSPECTED = int(os.getenv("FAST_SCAN_MAX_INSPECTED", "400"))
+DISCOVERY_OVERFETCH_MULTIPLIER = int(os.getenv("DISCOVERY_OVERFETCH_MULTIPLIER", "8"))
 DISCOVERY_BATCH_MAX = int(os.getenv("DISCOVERY_BATCH_MAX", "100"))
-MAX_PAGES_PER_FAST_SCAN = int(os.getenv("MAX_PAGES_PER_FAST_SCAN", "3"))
+MAX_PAGES_PER_FAST_SCAN = int(os.getenv("MAX_PAGES_PER_FAST_SCAN", "5"))
 PAGE_SIZE = min(int(os.getenv("PAGE_SIZE", "100")), 100)
+COINGECKO_MIN_INTERVAL_SECONDS = float(os.getenv("COINGECKO_MIN_INTERVAL_SECONDS", "2.2"))
+COINGECKO_429_RETRIES = int(os.getenv("COINGECKO_429_RETRIES", "4"))
+COINGECKO_429_BACKOFF_BASE = float(os.getenv("COINGECKO_429_BACKOFF_BASE", "5"))
 
 MAX_X_INACTIVE_DAYS = int(os.getenv("MAX_X_INACTIVE_DAYS", "30"))
 MAX_TG_INACTIVE_DAYS = int(os.getenv("MAX_TG_INACTIVE_DAYS", "30"))
@@ -210,6 +216,19 @@ def parse_iso_datetime(value: str) -> datetime:
     ).astimezone(timezone.utc)
 
 
+def meme_candidate_is_recent(candidate: DiscoveryCandidate) -> bool:
+    if not candidate.pair_created_at:
+        return False
+    try:
+        created = float(candidate.pair_created_at)
+        if created > 10_000_000_000:
+            created /= 1000
+        age_days = (utc_now().timestamp() - created) / 86400
+        return 0 <= age_days <= MEME_MAX_AGE_DAYS
+    except (TypeError, ValueError):
+        return False
+
+
 def display_datetime(value: Optional[datetime]) -> str:
     if value is None:
         return "Unavailable"
@@ -274,7 +293,7 @@ def build_http_session() -> requests.Session:
         read=3,
         status=3,
         backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
     )
@@ -2101,12 +2120,63 @@ LEADS_ENGINE = LeadEngine()
 # COINGECKO FAST DISCOVERY
 # =========================================================
 
+class CoinGeckoRateLimitError(RuntimeError):
+    pass
+
+
 class CoinGeckoClient:
     def __init__(self) -> None:
         self.headers: dict[str, str] = {}
+        self._rate_lock = threading.Lock()
+        self._last_request_at = 0.0
 
         if COINGECKO_API_KEY:
             self.headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
+    def _throttle(self) -> None:
+        with self._rate_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            wait_for = COINGECKO_MIN_INTERVAL_SECONDS - elapsed
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+
+    def _get_json(self, url: str, *, params: Optional[dict[str, Any]] = None) -> Any:
+        last_response = None
+        for attempt in range(COINGECKO_429_RETRIES + 1):
+            self._throttle()
+            response = HTTP.get(
+                url,
+                params=params,
+                headers=self.headers,
+                timeout=30,
+            )
+            last_response = response
+
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response.json()
+
+            retry_after = response.headers.get("Retry-After")
+            try:
+                wait_seconds = float(retry_after) if retry_after else 0.0
+            except (TypeError, ValueError):
+                wait_seconds = 0.0
+
+            if wait_seconds <= 0:
+                wait_seconds = COINGECKO_429_BACKOFF_BASE * (2 ** attempt)
+
+            LOGGER.warning(
+                "CoinGecko 429 rate limit. attempt=%s/%s waiting=%.1fs",
+                attempt + 1,
+                COINGECKO_429_RETRIES + 1,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+        raise CoinGeckoRateLimitError(
+            f"CoinGecko remained rate-limited after {COINGECKO_429_RETRIES + 1} attempts"
+        )
 
     def market_page(
         self,
@@ -2120,23 +2190,16 @@ class CoinGeckoClient:
             "per_page": PAGE_SIZE,
             "page": page,
         }
-
         if category_id:
             params["category"] = category_id
-
-        response = HTTP.get(
+        data = self._get_json(
             f"{COINGECKO_API_BASE}/coins/markets",
             params=params,
-            headers=self.headers,
-            timeout=30,
         )
-        response.raise_for_status()
-
-        data = response.json()
         return data if isinstance(data, list) else []
 
     def details(self, coin_id: str) -> dict[str, Any]:
-        response = HTTP.get(
+        data = self._get_json(
             f"{COINGECKO_API_BASE}/coins/{coin_id}",
             params={
                 "localization": "false",
@@ -2146,47 +2209,35 @@ class CoinGeckoClient:
                 "developer_data": "false",
                 "sparkline": "false",
             },
-            headers=self.headers,
-            timeout=30,
         )
-        response.raise_for_status()
-
-        data = response.json()
         return data if isinstance(data, dict) else {}
 
     @staticmethod
     def telegram_url(value: Any) -> Optional[str]:
         if not value:
             return None
-
         if isinstance(value, list):
             for item in value:
                 result = CoinGeckoClient.telegram_url(item)
                 if result:
                     return result
             return None
-
         text = str(value).strip()
-
         if not text:
             return None
-
         if text.startswith(("http://", "https://")):
             return text
-
         return f"https://t.me/{text.lstrip('@')}"
 
     @staticmethod
     def website_url(value: Any) -> Optional[str]:
         if not value:
             return None
-
         if isinstance(value, list):
             for item in value:
                 if item:
                     return str(item).strip()
             return None
-
         return str(value).strip() or None
 
 
@@ -2510,6 +2561,11 @@ def candidate_from_mobula(
         telegram_url=socials["telegram_url"],
         liquidity=liquidity,
         volume_24h=volume_24h,
+        pair_created_at=int(first_number(
+            token,
+            "createdAt", "created_at", "createdTimestamp",
+            "created_timestamp", "timestamp",
+        )) or None,
         metadata={"provider": "mobula"},
     )
 
@@ -2555,6 +2611,11 @@ def candidate_from_birdeye(
             item,
             "volume_24h_usd", "volume24h", "volume_24h",
         ),
+        pair_created_at=int(first_number(
+            item,
+            "creation_time", "created_at", "createdAt",
+            "launch_time", "launchTime", "pairCreatedAt",
+        )) or None,
         metadata={"provider": "birdeye"},
     )
 
@@ -2564,12 +2625,20 @@ async def discover_coingecko(params: FastScanParams) -> list[DiscoveryCandidate]
     inspected = 0
 
     for page in range(1, MAX_PAGES_PER_FAST_SCAN + 1):
-        market_page = await asyncio.to_thread(
-            COINGECKO.market_page,
-            page,
-            params.category_id,
-            params.sort_mode,
-        )
+        try:
+            market_page = await asyncio.to_thread(
+                COINGECKO.market_page,
+                page,
+                params.category_id,
+                params.sort_mode,
+            )
+        except CoinGeckoRateLimitError as error:
+            LOGGER.warning(
+                "CoinGecko discovery stopped gracefully at page %s: %s",
+                page,
+                error,
+            )
+            break
 
         if not market_page:
             break
@@ -2589,6 +2658,13 @@ async def discover_coingecko(params: FastScanParams) -> list[DiscoveryCandidate]
 
             try:
                 details = await asyncio.to_thread(COINGECKO.details, coin_id)
+            except CoinGeckoRateLimitError as error:
+                LOGGER.warning(
+                    "CoinGecko details rate-limited for %s: %s",
+                    coin_id,
+                    error,
+                )
+                break
             except Exception as error:
                 LOGGER.warning("CoinGecko details failed for %s: %s", coin_id, error)
                 continue
@@ -2650,6 +2726,16 @@ async def discover_coingecko(params: FastScanParams) -> list[DiscoveryCandidate]
             if address and chain:
                 candidate = await asyncio.to_thread(enrich_with_dex, candidate)
 
+            if params.asset_type == "meme":
+                if not (MEME_MIN_MARKET_CAP <= candidate.market_cap <= MEME_MAX_MARKET_CAP):
+                    continue
+                if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
+                    continue
+                if candidate.volume_24h and candidate.volume_24h < MEME_MIN_VOLUME_24H:
+                    continue
+                if not meme_candidate_is_recent(candidate):
+                    continue
+
             candidates.append(candidate)
             if len(candidates) >= min(
                 params.target_count * DISCOVERY_OVERFETCH_MULTIPLIER,
@@ -2708,6 +2794,8 @@ async def discover_mobula(params: FastScanParams) -> list[DiscoveryCandidate]:
             ):
                 continue
             if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
+                continue
+            if not meme_candidate_is_recent(candidate):
                 continue
 
         resolved_bucket = classify_candidate_bucket(
@@ -2796,6 +2884,15 @@ async def discover_birdeye(params: FastScanParams) -> list[DiscoveryCandidate]:
 
         candidate = await asyncio.to_thread(enrich_with_dex, candidate)
 
+        if not (MEME_MIN_MARKET_CAP <= candidate.market_cap <= MEME_MAX_MARKET_CAP):
+            continue
+        if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
+            continue
+        if candidate.volume_24h and candidate.volume_24h < MEME_MIN_VOLUME_24H:
+            continue
+        if not meme_candidate_is_recent(candidate):
+            continue
+
         candidates.append(candidate)
         if len(candidates) >= min(
             params.target_count * DISCOVERY_OVERFETCH_MULTIPLIER,
@@ -2853,6 +2950,8 @@ async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
             if candidate.liquidity < MEME_MIN_LIQUIDITY:
                 continue
             if candidate.volume_24h < MEME_MIN_VOLUME_24H:
+                continue
+            if not meme_candidate_is_recent(candidate):
                 continue
 
         resolved_bucket = classify_candidate_bucket(
@@ -6122,7 +6221,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter Opportunity v1.6 connected as @%s",
+        "Project Hunter Opportunity v1.7 connected as @%s",
         bot.username,
     )
     LOGGER.info(
