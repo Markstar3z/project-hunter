@@ -348,8 +348,193 @@ COINGECKO_SECTOR_IDS: dict[str, str] = {
     "stablecoin": "stablecoins",
 }
 
+
+def infer_altcoin_sector(
+    categories: Any,
+    requested_sector: str = "all",
+) -> str:
+    """
+    Return a useful altcoin sector label.
+
+    If the user explicitly requested a sector, preserve that intent using
+    Project Hunter's display label. For all-altcoin scans, infer the sector
+    from CoinGecko category metadata. If no Hunter taxonomy match exists,
+    use the most useful CoinGecko category instead of returning "all".
+    """
+    requested = str(requested_sector or "all").strip().lower()
+
+    if requested != "all":
+        return ALTCOIN_SECTORS.get(
+            requested,
+            requested_sector,
+        )
+
+    if not isinstance(categories, list):
+        categories = []
+
+    clean_categories = [
+        str(item).strip()
+        for item in categories
+        if str(item).strip()
+    ]
+
+    lowered = [
+        item.lower()
+        for item in clean_categories
+    ]
+
+    keyword_map = [
+        (
+            "Artificial Intelligence",
+            (
+                "artificial intelligence",
+                "ai agents",
+                "ai agent",
+                "machine learning",
+            ),
+        ),
+        (
+            "GameFi",
+            (
+                "gaming",
+                "gamefi",
+                "play to earn",
+                "gaming blockchain",
+            ),
+        ),
+        (
+            "DePIN",
+            (
+                "depin",
+                "decentralized physical infrastructure",
+            ),
+        ),
+        (
+            "Real World Assets",
+            (
+                "real world asset",
+                "real-world asset",
+                "rwa",
+            ),
+        ),
+        (
+            "Layer 2",
+            (
+                "layer 2",
+                "layer-2",
+                "rollup",
+                "optimistic rollup",
+                "zero knowledge rollup",
+                "zk-rollup",
+            ),
+        ),
+        (
+            "Layer 1",
+            (
+                "layer 1",
+                "layer-1",
+                "smart contract platform",
+            ),
+        ),
+        (
+            "Privacy",
+            (
+                "privacy",
+                "privacy coin",
+                "zero knowledge",
+                "zero-knowledge",
+            ),
+        ),
+        (
+            "Interoperability",
+            (
+                "interoperability",
+                "cross-chain",
+                "cross chain",
+                "bridge",
+            ),
+        ),
+        (
+            "Stablecoin",
+            (
+                "stablecoin",
+                "usd stablecoin",
+            ),
+        ),
+        (
+            "DEX",
+            (
+                "decentralized exchange",
+                "dex",
+            ),
+        ),
+        (
+            "NFT",
+            (
+                "nft",
+                "non-fungible",
+            ),
+        ),
+        (
+            "DeFi",
+            (
+                "decentralized finance",
+                "defi",
+                "lending",
+                "yield farming",
+                "liquid staking",
+            ),
+        ),
+        (
+            "Infrastructure",
+            (
+                "infrastructure",
+                "oracle",
+                "data availability",
+                "storage",
+                "decentralized storage",
+                "indexing",
+                "middleware",
+                "developer tools",
+            ),
+        ),
+    ]
+
+    for label, keywords in keyword_map:
+        for category in lowered:
+            if any(
+                keyword in category
+                for keyword in keywords
+            ):
+                return label
+
+    # Fall back to a real CoinGecko category rather than the meaningless "all".
+    ignored_fragments = (
+        "ecosystem",
+        "made in",
+        "portfolio",
+        "alleged sec",
+    )
+
+    for category in clean_categories:
+        category_lower = category.lower()
+
+        if any(
+            fragment in category_lower
+            for fragment in ignored_fragments
+        ):
+            continue
+
+        return category
+
+    # If only ecosystem/portfolio labels exist, they are still better than "all".
+    if clean_categories:
+        return clean_categories[0]
+
+    return "Unclassified"
+
 ALT_SOURCES = {"all", "coingecko", "mobula", "dex", "dexscreener"}
-MEME_SOURCES = {"all", "birdeye", "mobula", "dex", "dexscreener"}
+MEME_SOURCES = {"all", "coingecko", "birdeye", "mobula", "dex", "dexscreener"}
 MEME_LAUNCHPADS = {
     "all": "all",
     "pumpfun": "pump_dot_fun",
@@ -395,6 +580,70 @@ MOBULA_CHAIN_IDS = {
     "bsc": "evm:56",
     "base": "evm:8453",
 }
+
+
+MEME_CATEGORY_KEYWORDS = (
+    "meme", "memecoin", "dog-themed", "dog themed",
+    "cat-themed", "cat themed", "political meme",
+    "solana meme", "base meme", "bsc meme", "animal meme",
+)
+
+MEME_TEXT_KEYWORDS = (
+    "meme", "memecoin", "doge", "pepe", "shib",
+    "inu", "bonk", "wojak", "floki",
+)
+
+
+def category_is_memecoin(categories: Any) -> bool:
+    if not isinstance(categories, list):
+        return False
+    for item in categories:
+        text = str(item or "").strip().lower()
+        if text and any(k in text for k in MEME_CATEGORY_KEYWORDS):
+            return True
+    return False
+
+
+def text_looks_memecoin(
+    name: str = "",
+    symbol: str = "",
+    description: str = "",
+) -> bool:
+    haystack = f"{name} {symbol} {description}".lower()
+    return any(k in haystack for k in MEME_TEXT_KEYWORDS)
+
+
+def classify_candidate_bucket(
+    *,
+    source: str,
+    categories: Any = None,
+    name: str = "",
+    symbol: str = "",
+    description: str = "",
+    launchpad: str = "",
+    requested_asset_type: str = "alt",
+) -> str:
+    source = clean_source_name(source)
+    requested = str(requested_asset_type or "alt").lower()
+
+    if source == "coingecko":
+        return "meme" if category_is_memecoin(categories or []) else "alt"
+
+    if str(launchpad or "").lower() in {
+        "pumpfun", "pump.fun", "pump_dot_fun", "four.meme", "fourmeme",
+        "moonshot", "raydium_launchlab", "meteora_dynamic_bonding_curve",
+        "nad.fun", "nadfun",
+    }:
+        return "meme"
+
+    if source == "birdeye" and requested == "meme":
+        return "meme"
+
+    if text_looks_memecoin(name, symbol, description):
+        return "meme"
+
+    return "alt"
+
 
 def clean_source_name(value: str) -> str:
     value = (value or "").strip().lower()
@@ -2137,7 +2386,11 @@ def candidate_from_dex_pair(
         sector=sector,
         chain=normalize_chain(chain),
         contract_address=address.strip() if address else "",
-        launchpad=launchpad or first_text(pair, "dexId"),
+        launchpad=(
+            launchpad or first_text(pair, "dexId")
+            if asset_type == "meme"
+            else ""
+        ),
         website=socials["website"] or None,
         x_username=socials["x_username"],
         x_url=socials["x_url"],
@@ -2357,14 +2610,33 @@ async def discover_coingecko(params: FastScanParams) -> list[DiscoveryCandidate]
                         address = str(raw_address).strip()
                         break
 
+            categories = details.get("categories") or []
+            resolved_bucket = classify_candidate_bucket(
+                source="coingecko",
+                categories=categories,
+                name=str(coin.get("name") or ""),
+                symbol=str(coin.get("symbol") or ""),
+                description=str(details.get("description") or ""),
+                requested_asset_type=params.asset_type,
+            )
+
+            if resolved_bucket != params.asset_type:
+                continue
+
+            resolved_sector = (
+                "memecoin"
+                if resolved_bucket == "meme"
+                else infer_altcoin_sector(categories, params.sector)
+            )
+
             candidate = DiscoveryCandidate(
                 unique_id=str(coin_id),
                 name=str(coin.get("name") or ""),
                 symbol=str(coin.get("symbol") or "").upper(),
                 market_cap=market_cap,
                 source="coingecko",
-                asset_type="alt",
-                sector=params.sector,
+                asset_type=resolved_bucket,
+                sector=resolved_sector,
                 chain=chain,
                 contract_address=address,
                 website=website,
@@ -2410,7 +2682,11 @@ async def discover_mobula(params: FastScanParams) -> list[DiscoveryCandidate]:
         blockchain = None if params.chain == "all" else params.chain
         items = await asyncio.to_thread(MOBULA.trendings, blockchain)
         asset_type = "alt"
-        sector = params.sector
+        sector = (
+            infer_altcoin_sector([], params.sector)
+            if params.sector != "all"
+            else "Unclassified"
+        )
 
     candidates: list[DiscoveryCandidate] = []
 
@@ -2433,6 +2709,28 @@ async def discover_mobula(params: FastScanParams) -> list[DiscoveryCandidate]:
                 continue
             if candidate.liquidity and candidate.liquidity < MEME_MIN_LIQUIDITY:
                 continue
+
+        resolved_bucket = classify_candidate_bucket(
+            source="mobula",
+            name=candidate.name,
+            symbol=candidate.symbol,
+            description=str((candidate.metadata or {}).get("description") or ""),
+            launchpad=candidate.launchpad,
+            requested_asset_type=params.asset_type,
+        )
+        if resolved_bucket != params.asset_type:
+            continue
+
+        candidate.asset_type = resolved_bucket
+        candidate.sector = (
+            "memecoin"
+            if resolved_bucket == "meme"
+            else (
+                candidate.sector
+                if candidate.sector not in {"", "all", "memecoin"}
+                else "Unclassified"
+            )
+        )
 
         candidates.append(candidate)
         if len(candidates) >= min(
@@ -2534,7 +2832,15 @@ async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
         candidate = candidate_from_dex_pair(
             pair,
             asset_type=params.asset_type,
-            sector="memecoin" if params.asset_type == "meme" else params.sector,
+            sector=(
+                "memecoin"
+                if params.asset_type == "meme"
+                else (
+                    infer_altcoin_sector([], params.sector)
+                    if params.sector != "all"
+                    else "Unclassified"
+                )
+            ),
         )
         if not candidate:
             continue
@@ -2548,6 +2854,28 @@ async def discover_dex(params: FastScanParams) -> list[DiscoveryCandidate]:
                 continue
             if candidate.volume_24h < MEME_MIN_VOLUME_24H:
                 continue
+
+        resolved_bucket = classify_candidate_bucket(
+            source="dex",
+            name=candidate.name,
+            symbol=candidate.symbol,
+            description=str((candidate.metadata or {}).get("description") or ""),
+            launchpad=candidate.launchpad,
+            requested_asset_type=params.asset_type,
+        )
+        if resolved_bucket != params.asset_type:
+            continue
+
+        candidate.asset_type = resolved_bucket
+        candidate.sector = (
+            "memecoin"
+            if resolved_bucket == "meme"
+            else (
+                candidate.sector
+                if candidate.sector not in {"", "all", "memecoin"}
+                else "Unclassified"
+            )
+        )
 
         candidates.append(candidate)
         if len(candidates) >= min(
@@ -2563,31 +2891,47 @@ async def discover_candidates(
     params: FastScanParams,
     progress_callback: Optional[Any] = None,
 ) -> tuple[list[DiscoveryCandidate], list[str]]:
-    """Run selected providers, normalize results, and deduplicate by chain+contract."""
+    """
+    Run the selected discovery providers.
+
+    Individual source:
+        Only that provider contributes discovery candidates.
+
+    All Sources:
+        Build a UNION of every valid provider's candidates first, then
+        deduplicate/enrich overlaps. A project does not need to exist on
+        another provider to survive.
+    """
     requested = clean_source_name(params.source)
     warnings: list[str] = []
-    providers = []
+    providers: list[tuple[str, Any]] = []
 
     if params.asset_type == "alt":
         if params.sector != "all":
             if requested == "all":
-                # CoinGecko provides the explicit category taxonomy. DEX still
-                # enriches the resulting CoinGecko contracts inside the provider.
+                # CoinGecko is currently the provider with reliable category
+                # taxonomy for strict sector filtering.
                 available = ["coingecko"]
                 warnings.append(
-                    "Sector-specific altcoin scans use CoinGecko for discovery "
-                    "because Mobula/Dex do not expose the same category taxonomy."
+                    "Strict sector scans use CoinGecko discovery because the "
+                    "other providers do not expose equivalent sector taxonomy."
                 )
-            elif requested != "coingecko":
+            elif requested == "coingecko":
+                available = ["coingecko"]
+            else:
                 available = []
                 warnings.append(
-                    f"{requested} cannot guarantee the requested altcoin sector. "
-                    "Use source=coingecko or source=all for sector scans."
+                    f"{requested} cannot reliably enforce the requested "
+                    "altcoin sector. Choose CoinGecko, or choose All Altcoins "
+                    "before selecting Mobula/DEX Screener."
                 )
-            else:
-                available = ["coingecko"]
         else:
-            available = ["coingecko", "mobula", "dex"] if requested == "all" else [requested]
+            # IMPORTANT: this is a union, not an intersection.
+            available = (
+                ["coingecko", "mobula", "dex"]
+                if requested == "all"
+                else [requested]
+            )
     else:
         if params.launchpad != "all":
             if requested == "all":
@@ -2600,19 +2944,26 @@ async def discover_candidates(
                     "DEX Screener cannot reliably identify the original meme "
                     "launchpad. Use Birdeye or Mobula for launchpad-specific scans."
                 )
-            elif requested == "mobula" and params.launchpad not in MOBULA_POOL_TYPES:
+            elif (
+                requested == "mobula"
+                and params.launchpad not in MOBULA_POOL_TYPES
+            ):
                 available = []
                 warnings.append(
-                    f"Mobula launchpad mapping is not configured for {params.launchpad}. "
-                    "Use Birdeye for this launchpad."
+                    f"Mobula launchpad mapping is not configured for "
+                    f"{params.launchpad}. Use Birdeye for this launchpad."
                 )
             else:
                 available = [requested]
         else:
-            available = ["birdeye", "mobula", "dex"] if requested == "all" else [requested]
+            available = (
+                ["coingecko", "birdeye", "mobula", "dex"]
+                if requested == "all"
+                else [requested]
+            )
 
     for source in available:
-        if source == "coingecko" and params.asset_type == "alt":
+        if source == "coingecko" and params.asset_type in {"alt", "meme"}:
             providers.append(("coingecko", discover_coingecko(params)))
         elif source == "mobula":
             providers.append(("mobula", discover_mobula(params)))
@@ -2621,54 +2972,120 @@ async def discover_candidates(
         elif source == "dex":
             providers.append(("dex", discover_dex(params)))
         else:
-            warnings.append(f"Source '{source}' is not valid for {params.asset_type} scans.")
+            warnings.append(
+                f"Source '{source}' is not valid for "
+                f"{params.asset_type} scans."
+            )
 
-    merged: dict[str, DiscoveryCandidate] = {}
-
+    # Keep each provider's raw discoveries separate first. This prevents
+    # CoinGecko/DEX overlaps from crowding Mobula-only projects out before
+    # the union is constructed.
+    provider_rows: dict[str, list[DiscoveryCandidate]] = {}
+    provider_counts: dict[str, int] = {}
     total_providers = len(providers)
 
-    for provider_number, (source_name, coroutine) in enumerate(providers, start=1):
+    for provider_number, (source_name, coroutine) in enumerate(
+        providers,
+        start=1,
+    ):
         if progress_callback:
             await progress_callback(
                 stage="discovering",
                 provider=source_name,
                 provider_number=provider_number,
                 provider_total=total_providers,
-                discovered=len(merged),
+                discovered=sum(provider_counts.values()),
+                provider_counts=dict(provider_counts),
             )
 
         try:
             rows = await coroutine
         except Exception as error:
             LOGGER.exception("%s discovery failed", source_name)
-            warnings.append(f"{source_name}: {type(error).__name__}: {error}")
+            warnings.append(
+                f"{source_name}: {type(error).__name__}: {error}"
+            )
+            provider_rows[source_name] = []
+            provider_counts[source_name] = 0
+
             if progress_callback:
                 await progress_callback(
                     stage="provider_failed",
                     provider=source_name,
                     provider_number=provider_number,
                     provider_total=total_providers,
-                    discovered=len(merged),
+                    discovered=sum(provider_counts.values()),
+                    provider_counts=dict(provider_counts),
                 )
             continue
 
-        for candidate in rows:
-            matched_key: Optional[str] = None
+        provider_rows[source_name] = list(rows)
+        provider_counts[source_name] = len(rows)
 
-            # First try exact normalized contract identity.
-            if candidate.chain and candidate.contract_address:
-                contract_key = (
-                    f"contract:{normalize_chain(candidate.chain)}:"
-                    f"{candidate.contract_address.strip().lower()}"
-                )
-                if contract_key in merged:
-                    matched_key = contract_key
+        LOGGER.info(
+            "Discovery provider complete: %s raw=%s",
+            source_name,
+            len(rows),
+        )
 
-            # Fallback to social/website identities when provider contract
-            # metadata is missing or represented differently.
-            if matched_key is None:
-                candidate_keys = project_identity_keys(candidate.to_project())
+        if progress_callback:
+            await progress_callback(
+                stage="provider_complete",
+                provider=source_name,
+                provider_number=provider_number,
+                provider_total=total_providers,
+                discovered=sum(provider_counts.values()),
+                provider_found=len(rows),
+                provider_counts=dict(provider_counts),
+            )
 
+    # Round-robin the raw provider lists for All Sources. This gives each
+    # provider a fair chance to contribute before the final inspection cap.
+    raw_union: list[DiscoveryCandidate] = []
+
+    if requested == "all" and len(provider_rows) > 1:
+        longest = max(
+            (len(rows) for rows in provider_rows.values()),
+            default=0,
+        )
+
+        provider_order = [
+            name
+            for name, _ in providers
+        ]
+
+        for index in range(longest):
+            for source_name in provider_order:
+                rows = provider_rows.get(source_name, [])
+                if index < len(rows):
+                    raw_union.append(rows[index])
+    else:
+        for source_name, _ in providers:
+            raw_union.extend(
+                provider_rows.get(source_name, [])
+            )
+
+    # UNION -> deduplicate/enrich. A candidate is inserted on first sight.
+    # Matching candidates from later providers only enrich that same record.
+    merged: dict[str, DiscoveryCandidate] = {}
+
+    for candidate in raw_union:
+        matched_key: Optional[str] = None
+
+        if candidate.chain and candidate.contract_address:
+            contract_key = (
+                f"contract:{normalize_chain(candidate.chain)}:"
+                f"{candidate.contract_address.strip().lower()}"
+            )
+            if contract_key in merged:
+                matched_key = contract_key
+
+        if matched_key is None:
+            candidate_keys = project_identity_keys(
+                candidate.to_project()
+            )
+
+            if candidate_keys:
                 for existing_key, existing_candidate in merged.items():
                     existing_keys = project_identity_keys(
                         existing_candidate.to_project()
@@ -2677,44 +3094,104 @@ async def discover_candidates(
                         matched_key = existing_key
                         break
 
-            if matched_key is not None:
-                merged[matched_key] = merge_candidate(
-                    merged[matched_key],
-                    candidate,
-                )
-                continue
+        if matched_key is not None:
+            merged[matched_key] = merge_candidate(
+                merged[matched_key],
+                candidate,
+            )
+            continue
 
-            if candidate.chain and candidate.contract_address:
-                new_key = (
-                    f"contract:{normalize_chain(candidate.chain)}:"
-                    f"{candidate.contract_address.strip().lower()}"
-                )
-            else:
-                new_key = candidate.unique_id
-
-            merged[new_key] = candidate
-
-        if progress_callback:
-            await progress_callback(
-                stage="provider_complete",
-                provider=source_name,
-                provider_number=provider_number,
-                provider_total=total_providers,
-                discovered=len(merged),
-                provider_found=len(rows),
+        if candidate.chain and candidate.contract_address:
+            new_key = (
+                f"contract:{normalize_chain(candidate.chain)}:"
+                f"{candidate.contract_address.strip().lower()}"
+            )
+        else:
+            new_key = (
+                f"{clean_source_name(candidate.source)}:"
+                f"{candidate.unique_id}"
             )
 
-    # Favor candidates that already have actionable contact/social data.
-    ordered = sorted(
-        merged.values(),
-        key=lambda c: (
-            bool(c.x_username and c.telegram_url),
-            c.volume_24h,
-            c.liquidity,
-            c.market_cap,
-        ),
-        reverse=True,
-    )
+        # Collision-safe fallback for provider-specific IDs.
+        if new_key in merged:
+            suffix = 2
+            base_key = new_key
+            while new_key in merged:
+                new_key = f"{base_key}:{suffix}"
+                suffix += 1
+
+        merged[new_key] = candidate
+
+    # Preserve fair source representation for All Sources instead of sorting
+    # all CoinGecko/DEX-enriched candidates above provider-only candidates.
+    if requested == "all" and len(provider_rows) > 1:
+        source_queues: dict[str, list[DiscoveryCandidate]] = {
+            name: []
+            for name, _ in providers
+        }
+        leftovers: list[DiscoveryCandidate] = []
+
+        for candidate in merged.values():
+            sources = {
+                clean_source_name(part)
+                for part in str(candidate.source or "").split(",")
+                if part.strip()
+            }
+
+            # Assign the candidate to its first matching discovery provider.
+            assigned = False
+            for source_name, _ in providers:
+                if source_name in sources:
+                    source_queues[source_name].append(candidate)
+                    assigned = True
+                    break
+
+            if not assigned:
+                leftovers.append(candidate)
+
+        # Rank within each source, then interleave providers.
+        for queue in source_queues.values():
+            queue.sort(
+                key=lambda c: (
+                    bool(c.x_username and c.telegram_url),
+                    c.volume_24h,
+                    c.liquidity,
+                    c.market_cap,
+                ),
+                reverse=True,
+            )
+
+        ordered: list[DiscoveryCandidate] = []
+        seen_objects: set[int] = set()
+        longest = max(
+            (len(queue) for queue in source_queues.values()),
+            default=0,
+        )
+
+        for index in range(longest):
+            for source_name, _ in providers:
+                queue = source_queues[source_name]
+                if index >= len(queue):
+                    continue
+                candidate = queue[index]
+                marker = id(candidate)
+                if marker in seen_objects:
+                    continue
+                seen_objects.add(marker)
+                ordered.append(candidate)
+
+        ordered.extend(leftovers)
+    else:
+        ordered = sorted(
+            merged.values(),
+            key=lambda c: (
+                bool(c.x_username and c.telegram_url),
+                c.volume_24h,
+                c.liquidity,
+                c.market_cap,
+            ),
+            reverse=True,
+        )
 
     discovery_limit = min(
         max(
@@ -2723,6 +3200,27 @@ async def discover_candidates(
         ),
         FAST_SCAN_MAX_INSPECTED,
     )
+
+    LOGGER.info(
+        "Discovery union complete: providers=%s raw=%s unique=%s returning=%s",
+        provider_counts,
+        sum(provider_counts.values()),
+        len(merged),
+        min(len(ordered), discovery_limit),
+    )
+
+    if progress_callback:
+        await progress_callback(
+            stage="union_complete",
+            provider="all" if requested == "all" else requested,
+            provider_number=total_providers,
+            provider_total=total_providers,
+            discovered=len(merged),
+            provider_counts=dict(provider_counts),
+            raw_discovered=sum(provider_counts.values()),
+            unique_discovered=len(merged),
+        )
+
     return ordered[:discovery_limit], warnings
 
 
@@ -3139,7 +3637,10 @@ async def run_fast_scan(
                         )
                         + (
                             f"Launchpad: {project['launchpad']}\n"
-                            if project.get("launchpad")
+                            if (
+                                project.get("asset_type") == "meme"
+                                and project.get("launchpad")
+                            )
                             else ""
                         )
                         + f"Market cap: ${project['market_cap']:,}\n"
@@ -3606,7 +4107,11 @@ def format_analysis(result: dict[str, Any]) -> str:
     lines = [
         f"Project: {result['name']} (${result['symbol']})",
         f"Type: {result.get('asset_type', 'alt')}",
-        f"Sector: {result.get('sector', 'all')}",
+        f"Sector: {(
+            result.get('sector')
+            if result.get('sector') not in {None, '', 'all'}
+            else 'Unclassified'
+        )}",
         f"Source(s): {result.get('sources') or result.get('source') or 'unknown'}",
         f"Score: {result['score']}/100",
         f"Classification: {result['classification']}",
@@ -4013,7 +4518,15 @@ def format_saved(rows: list[dict[str, Any]]) -> str:
             f"Project: {row['name']} (${row['symbol']})\n"
             f"Stage: {row['stage']}\n"
             f"Type: {row.get('asset_type') or 'alt'}\n"
-            f"Sector: {row.get('sector') or row.get('category') or 'all'}\n"
+            f"Sector: {(
+                row.get('sector')
+                if row.get('sector') not in {None, '', 'all'}
+                else (
+                    row.get('category')
+                    if row.get('category') not in {None, '', 'all'}
+                    else 'Unclassified'
+                )
+            )}\n"
             f"Source(s): {row.get('sources') or row.get('source') or 'unknown'}\n"
             f"Score: {row['score'] or 0}/100\n"
             f"Market cap: ${int(row['market_cap'] or 0):,}\n"
@@ -4212,7 +4725,7 @@ def meme_launchpad_keyboard() -> list[list[Button]]:
 def source_keyboard(asset_type: str, sector_or_launchpad: str) -> list[list[Button]]:
     if asset_type == "alt":
         return [
-            [Button.inline("🌐 All Sources", b"scan:source:all")],
+            [Button.inline("🌐 All Sources (Union)", b"scan:source:all")],
             [
                 Button.inline("🦎 CoinGecko", b"scan:source:coingecko"),
                 Button.inline("📊 Mobula", b"scan:source:mobula"),
@@ -4226,12 +4739,13 @@ def source_keyboard(asset_type: str, sector_or_launchpad: str) -> list[list[Butt
         ]
 
     buttons: list[list[Button]] = [
-        [Button.inline("🌐 All Sources", b"scan:source:all")],
+        [Button.inline("🌐 All Sources (Union)", b"scan:source:all")],
         [
+            Button.inline("🦎 CoinGecko", b"scan:source:coingecko"),
             Button.inline("👁 Birdeye", b"scan:source:birdeye"),
-            Button.inline("📊 Mobula", b"scan:source:mobula"),
         ],
         [
+            Button.inline("📊 Mobula", b"scan:source:mobula"),
             Button.inline("📈 DEX Screener", b"scan:source:dex"),
         ],
         [
@@ -4622,6 +5136,7 @@ async def scan_menu_callback(event: events.CallbackQuery.Event) -> None:
                 "• Mobula\n"
                 "• DEX Screener\n\n"
                 "Memecoins:\n"
+                "• CoinGecko (meme categories only)\n"
                 "• Birdeye\n"
                 "• Mobula\n"
                 "• DEX Screener"
@@ -5607,7 +6122,7 @@ async def main() -> None:
     bot = await bot_client.get_me()
 
     LOGGER.info(
-        "Project Hunter Opportunity v1.3 connected as @%s",
+        "Project Hunter Opportunity v1.6 connected as @%s",
         bot.username,
     )
     LOGGER.info(
